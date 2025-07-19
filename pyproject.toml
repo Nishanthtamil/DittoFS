@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dittofs"
+version = "0.1.0"
+description = "Dropbox without the cloud – peer-to-peer sync"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pyfuse3 >= 3.2",
+    "trio",
+    "blake3",
+    "bleak",
+]
+
+[project.scripts]
+dittofs = "dittofs.cli:main"
