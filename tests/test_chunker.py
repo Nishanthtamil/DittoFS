@@ -16,4 +16,4 @@ def test_roundtrip():
 
     # check identical
     assert hashlib.sha256(src.read_bytes()).digest() == hashlib.sha256(dst.read_bytes()).digest()
-    print("✅ roundtrip ok")
+    print("roundtrip ok")

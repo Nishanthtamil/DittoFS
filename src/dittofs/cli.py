@@ -2,6 +2,7 @@ import trio, sys, argparse, pathlib
 from .hello_dittofs import HelloFS   
 from .chunker import split, join  
 import pyfuse3  
+from .crdt_store import CRDTStore
 
 # FUSE mount
 async def main_mount(path):
@@ -15,7 +16,10 @@ async def main_mount(path):
 # chunk commands
 def cli_add(args):
     hashes = list(split(pathlib.Path(args.file)))
-    print("chunks:", *hashes)
+    store = CRDTStore.load()
+    store.add_file(pathlib.Path(args.file), hashes)
+    store.save()
+    print("registered:", args.file, "chunks:", *hashes)
 
 def cli_get(args):
     hashes = args.hashes.split(",")
