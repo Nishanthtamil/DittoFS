@@ -1,8 +1,9 @@
-import trio, sys, argparse, pathlib
+import trio, sys, argparse, pathlib , asyncio
 from .hello_dittofs import HelloFS   
 from .chunker import split, join  
 import pyfuse3  
 from .crdt_store import CRDTStore
+from .ble_peer import advertise_and_send, scan_and_receive
 
 # FUSE mount
 async def main_mount(path):
@@ -25,6 +26,13 @@ def cli_get(args):
     hashes = args.hashes.split(",")
     join(hashes, pathlib.Path(args.out))
 
+# for pairing
+def cli_pair(args):
+    if args.role == "advert":
+        asyncio.run(advertise_and_send(b"hello"))
+    else:
+        asyncio.run(scan_and_receive())
+
 # Unified CLI builder
 def build_cli():
     p = argparse.ArgumentParser(prog="dittofs")
@@ -45,6 +53,10 @@ def build_cli():
     get_p.add_argument("hashes")
     get_p.add_argument("out")
     get_p.set_defaults(func=cli_get)
+
+    pair_cmd = sub.add_parser("pair")
+    pair_cmd.add_argument("role", choices=["advert", "scan"]) 
+    pair_cmd.set_defaults(func=cli_pair)
 
     return p
 
