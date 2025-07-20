@@ -1,20 +1,28 @@
-name: Build and Release Executables
+name: Build and Release
 on:
   push:
     tags:
       - 'v*'
 
 jobs:
-  build-release:
+  build-and-release:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            asset_name_suffix: ""
+          - os: macos-latest
+            asset_name_suffix: ""
+          - os: windows-latest
+            asset_name_suffix: ".exe"
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -23,18 +31,32 @@ jobs:
       - name: Install FUSE library for Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+
       - name: Install Python dependencies
         run: |
-          pip install pyinstaller
+          pip install pyinstaller pyqt6
           # Conditionally install pyfuse3 only on Linux.
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             pip install pyfuse3
           fi
-
+      
       - name: Build executable with PyInstaller
         run: pyinstaller dittofs.spec
-      - name: Upload executable as an artifact
-        uses: actions/upload-artifact@v4
+
+      - name: Set asset name
+        id: set_name
+        run: echo "ASSET_NAME=dittofs-${{ matrix.os }}${{ matrix.asset_name_suffix }}" >> $GITHUB_ENV
+
+      - name: Rename executable (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: mv dist/dittofs${{ matrix.asset_name_suffix }} dist/${{ env.ASSET_NAME }}
+
+      - name: Rename executable (Windows)
+        if: runner.os == 'Windows'
+        run: move dist\dittofs${{ matrix.asset_name_suffix }} dist\${{ env.ASSET_NAME }}
+        
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v1
         with:
-          name: dittofs-${{ matrix.os }}
-          path: dist/dittofs*
+          files: dist/${{ env.ASSET_NAME }}
+

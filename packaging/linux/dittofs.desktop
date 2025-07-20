@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=DittoFS
+Exec=/usr/local/bin/dittofs tray
+Type=Application
