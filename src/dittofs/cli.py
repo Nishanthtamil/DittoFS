@@ -4,6 +4,7 @@ from .chunker import split, join
 import pyfuse3  
 from .crdt_store import CRDTStore
 from .ble_peer import advertise_and_send, scan_and_receive
+from .gui import TrayApp
 
 # FUSE mount
 async def main_mount(path):
@@ -32,6 +33,10 @@ def cli_pair(args):
         asyncio.run(advertise_and_send(b"hello"))
     else:
         asyncio.run(scan_and_receive())
+# for GUI
+def cli_tray(args):
+    app = TrayApp()
+    app.exec()
 
 # Unified CLI builder
 def build_cli():
@@ -54,10 +59,15 @@ def build_cli():
     get_p.add_argument("out")
     get_p.set_defaults(func=cli_get)
 
+    # pair
     pair_cmd = sub.add_parser("pair")
     pair_cmd.add_argument("role", choices=["advert", "scan"]) 
     pair_cmd.set_defaults(func=cli_pair)
 
+    # GUI
+    tray_cmd = sub.add_parser("tray")
+    tray_cmd.set_defaults(func=cli_tray)
+    
     return p
 
 def main():
