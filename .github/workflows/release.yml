@@ -1,0 +1,40 @@
+name: Build and Release Executables
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-release:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FUSE library for Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Install Python dependencies
+        run: |
+          pip install pyinstaller
+          # Conditionally install pyfuse3 only on Linux.
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            pip install pyfuse3
+          fi
+
+      - name: Build executable with PyInstaller
+        run: pyinstaller dittofs.spec
+      - name: Upload executable as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dittofs-${{ matrix.os }}
+          path: dist/dittofs*
