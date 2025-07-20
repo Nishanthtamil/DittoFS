@@ -12,7 +12,10 @@ dependencies = [
     "pyfuse3 >= 3.2",
     "trio",
     "blake3",
-    "bleak",
+    "bleak < 0.20.0",
+    "bless",
+    "pycrdt",
+    "qrcode",
 ]
 
 [project.scripts]
