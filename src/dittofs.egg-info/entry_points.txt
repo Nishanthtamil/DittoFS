@@ -1,0 +1,2 @@
+[console_scripts]
+dittofs = dittofs.cli:main
