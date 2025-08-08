@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: dittofs
+Version: 0.1.0
+Summary: Dropbox without the cloud – peer-to-peer sync
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: pyfuse3>=3.2
+Requires-Dist: trio
+Requires-Dist: blake3
+Requires-Dist: bleak<0.20.0
+Requires-Dist: bless
+Requires-Dist: pycrdt
+Requires-Dist: qrcode
+Dynamic: license-file
+
+# DittoFS
+A mount wherever filesystem

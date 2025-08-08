@@ -1,14 +1,13 @@
-# src/dittofs/cli.py
 import asyncio
 import argparse
 import pathlib
 import sys
 import logging
 import signal
+import time
 from typing import Optional
-
-# Import our improved components
-from .crdt_store import CRDTStore, SyncManager, run_dittofs_daemon
+from .crdt_store import CRDTStore
+from .sync_mannager import SyncManager,run_dittofs_daemon
 from .transport import TransportManager
 from .chunker import split, join
 from .hello_dittofs import HelloFS
@@ -29,8 +28,11 @@ except ImportError:
     FUSE_AVAILABLE = False
     logging.warning("FUSE not available - install pyfuse3 for mounting")
 
+import argparse
+import sys
+
 class DittoFSCLI:
-    """Main CLI application"""
+    """Fixed CLI application"""
     
     def __init__(self):
         self.store = None
@@ -40,57 +42,19 @@ class DittoFSCLI:
     async def init_components(self):
         """Initialize DittoFS components"""
         if not self.store:
-            self.store = CRDTStore()
-            self.transport = TransportManager()
-            self.sync_manager = SyncManager(self.store, self.transport)
-    
-    async def cmd_daemon(self, args):
-        """Run the DittoFS daemon"""
-        print("Starting DittoFS daemon...")
-        
-        # Set up logging
-        log_level = logging.DEBUG if args.verbose else logging.INFO
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        
-        # Handle shutdown gracefully
-        shutdown_event = asyncio.Event()
-        
-        def signal_handler():
-            logging.info("Received shutdown signal")
-            shutdown_event.set()
-        
-        # Set up signal handlers
-        if hasattr(signal, 'SIGTERM'):
-            signal.signal(signal.SIGTERM, lambda s, f: signal_handler())
-        signal.signal(signal.SIGINT, lambda s, f: signal_handler())
-        
-        try:
-            # Run daemon with shutdown handling
-            daemon_task = asyncio.create_task(run_dittofs_daemon())
-            
-            # Wait for shutdown signal
-            await shutdown_event.wait()
-            
-            logging.info("Shutting down gracefully...")
-            daemon_task.cancel()
-            
             try:
-                await daemon_task
-            except asyncio.CancelledError:
-                pass
-                
-        except Exception as e:
-            logging.error(f"Daemon error: {e}")
-            return 1
-        
-        return 0
+                self.store = CRDTStore()
+                self.transport = TransportManager()
+                self.sync_manager = SyncManager(self.store, self.transport)
+            except Exception as e:
+                print(f"Failed to initialize components: {e}")
+                return False
+        return True
     
     async def cmd_add(self, args):
         """Add a file to the distributed file system"""
-        await self.init_components()
+        if not await self.init_components():
+            return 1
         
         file_path = pathlib.Path(args.file)
         if not file_path.exists():
@@ -98,18 +62,24 @@ class DittoFSCLI:
             return 1
         
         try:
+            from .chunker import split
+            
             # Split file into chunks
             print(f"Chunking file: {file_path}")
-            hashes = list(split(file_path))
+            hashes = split(file_path)
+            
+            if not hashes:
+                print(f"Failed to chunk file: {file_path}")
+                return 1
             
             # Add to CRDT store
             if self.store.add_file(file_path, hashes):
                 self.store.save()
-                print(f"Added file: {file_path}")
-                print(f"Chunks: {len(hashes)}")
+                print(f"✓ Added file: {file_path}")
+                print(f"  Chunks: {len(hashes)}")
                 if args.verbose:
                     for i, h in enumerate(hashes):
-                        print(f"  {i+1}: {h}")
+                        print(f"    {i+1}: {h[:16]}...")
                 return 0
             else:
                 print(f"Failed to add file: {file_path}")
@@ -117,11 +87,15 @@ class DittoFSCLI:
                 
         except Exception as e:
             print(f"Error adding file: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
             return 1
     
     async def cmd_list(self, args):
         """List files in the distributed file system"""
-        await self.init_components()
+        if not await self.init_components():
+            return 1
         
         try:
             files = self.store.list_files()
@@ -141,7 +115,7 @@ class DittoFSCLI:
                 if args.verbose:
                     print(f"    Size: {file_record.size} bytes")
                     print(f"    Chunks: {len(file_record.hashes)}")
-                    print(f"    Modified: {file_record.mtime}")
+                    print(f"    Modified: {time.ctime(file_record.mtime)}")
                     print(f"    Checksum: {file_record.checksum[:16]}...")
             
             # Show missing chunks
@@ -150,7 +124,7 @@ class DittoFSCLI:
                 if missing:
                     print(f"\nMissing chunks ({len(missing)}):")
                     for chunk_hash in list(missing)[:10]:  # Show first 10
-                        print(f"  {chunk_hash}")
+                        print(f"  {chunk_hash[:16]}...")
                     if len(missing) > 10:
                         print(f"  ... and {len(missing) - 10} more")
                         
@@ -162,9 +136,12 @@ class DittoFSCLI:
     
     async def cmd_get(self, args):
         """Reconstruct a file from chunks"""
-        await self.init_components()
+        if not await self.init_components():
+            return 1
         
         try:
+            from .chunker import join, CHUNK_DIR
+            
             if args.hashes:
                 # Get by explicit hash list
                 hashes = args.hashes.split(',')
@@ -185,14 +162,14 @@ class DittoFSCLI:
             # Check if all chunks exist
             missing = []
             for h in hashes:
-                chunk_path = pathlib.Path.home() / ".dittofs" / "chunks" / h
+                chunk_path = CHUNK_DIR / h
                 if not chunk_path.exists():
                     missing.append(h)
             
             if missing:
                 print(f"Missing {len(missing)} chunks:")
                 for h in missing[:5]:  # Show first 5
-                    print(f"  {h}")
+                    print(f"  {h[:16]}...")
                 if len(missing) > 5:
                     print(f"  ... and {len(missing) - 5} more")
                 print("\nTry running 'dittofs sync' to fetch missing chunks")
@@ -200,10 +177,12 @@ class DittoFSCLI:
             
             # Reconstruct file
             print(f"Reconstructing file from {len(hashes)} chunks...")
-            join(hashes, out_path)
-            print(f"File reconstructed: {out_path}")
-            
-            return 0
+            if join(hashes, out_path):
+                print(f"✓ File reconstructed: {out_path}")
+                return 0
+            else:
+                print("Failed to reconstruct file")
+                return 1
             
         except Exception as e:
             print(f"Error reconstructing file: {e}")
@@ -211,7 +190,8 @@ class DittoFSCLI:
     
     async def cmd_sync(self, args):
         """Force synchronization with peers"""
-        await self.init_components()
+        if not await self.init_components():
+            return 1
         
         try:
             print("Starting synchronization...")
@@ -235,25 +215,22 @@ class DittoFSCLI:
                 print(f"  {peer.peer_id} via {peer.transport_type}")
             
             # Perform sync
-            if args.peer_id:
-                # Sync with specific peer
-                success = await self.sync_manager.force_sync_with_peer(args.peer_id)
-                if success:
-                    print(f"Synced with peer: {args.peer_id}")
-                else:
-                    print(f"Failed to sync with peer: {args.peer_id}")
-            else:
-                # Sync with all peers
-                sync_count = 0
-                for peer in peers:
-                    try:
-                        if await self.sync_manager.force_sync_with_peer(peer.peer_id):
-                            sync_count += 1
-                            print(f"Synced with: {peer.peer_id}")
-                    except Exception as e:
-                        print(f"Sync failed with {peer.peer_id}: {e}")
-                
-                print(f"Successfully synced with {sync_count}/{len(peers)} peers")
+            sync_count = 0
+            for peer in peers:
+                try:
+                    print(f"Syncing with {peer.peer_id}...")
+                    if await self.sync_manager.force_sync_with_peer(peer.peer_id):
+                        sync_count += 1
+                        print(f"  ✓ Synced with: {peer.peer_id}")
+                    else:
+                        print(f"  ✗ Failed to sync with: {peer.peer_id}")
+                except Exception as e:
+                    print(f"  ✗ Sync failed with {peer.peer_id}: {e}")
+            
+            print(f"\nSynchronization complete: {sync_count}/{len(peers)} peers")
+            
+            # Save changes
+            self.store.save()
             
             await self.transport.stop_all()
             return 0
@@ -264,7 +241,8 @@ class DittoFSCLI:
     
     async def cmd_status(self, args):
         """Show DittoFS status"""
-        await self.init_components()
+        if not await self.init_components():
+            return 1
         
         try:
             files = self.store.list_files()
@@ -281,13 +259,16 @@ class DittoFSCLI:
             print(f"Remote files: {len(files) - local_files}")
             
             # Storage usage
-            chunk_dir = pathlib.Path.home() / ".dittofs" / "chunks"
-            if chunk_dir.exists():
-                chunk_count = len(list(chunk_dir.glob("*")))
-                total_size = sum(f.stat().st_size for f in chunk_dir.glob("*"))
+            from .chunker import CHUNK_DIR
+            if CHUNK_DIR.exists():
+                chunks = list(CHUNK_DIR.glob("*"))
+                chunk_count = len(chunks)
+                total_size = sum(f.stat().st_size for f in chunks if f.is_file())
                 print(f"Chunk storage: {chunk_count} chunks, {total_size // 1024} KB")
+            else:
+                print("Chunk storage: 0 chunks, 0 KB")
             
-            if args.verbose:
+            if args.verbose and files:
                 print("\nRecent files:")
                 recent_files = sorted(files, key=lambda f: f.mtime, reverse=True)[:5]
                 for f in recent_files:
@@ -300,45 +281,9 @@ class DittoFSCLI:
         
         return 0
     
-    async def cmd_mount(self, args):
-        """Mount DittoFS as a FUSE filesystem"""
-        if not FUSE_AVAILABLE:
-            print("FUSE not available. Install pyfuse3: pip install pyfuse3")
-            return 1
-        
-        try:
-            mountpoint = pathlib.Path(args.mountpoint)
-            if not mountpoint.exists():
-                mountpoint.mkdir(parents=True, exist_ok=True)
-            
-            print(f"Mounting DittoFS at: {mountpoint}")
-            
-            operations = HelloFS()  # You'd enhance this to use the CRDT store
-            pyfuse3.init(operations, str(mountpoint), [])
-            
-            try:
-                await pyfuse3.main()
-            finally:
-                pyfuse3.close(unmount=True)
-                
-        except Exception as e:
-            print(f"Mount error: {e}")
-            return 1
-        
-        return 0
-    
-    def cmd_tray(self, args):
-        """Start GUI tray application"""
-        if not GUI_AVAILABLE:
-            print("GUI not available. Install PyQt6: pip install PyQt6")
-            return 1
-        
-        try:
-            app = TrayApp()
-            return app.exec()
-        except Exception as e:
-            print(f"GUI error: {e}")
-            return 1
+    async def cmd_daemon(self, args):
+        """Run the DittoFS daemon"""
+        return await run_dittofs_daemon()
 
 def build_parser():
     """Build the argument parser"""
@@ -354,7 +299,6 @@ def build_parser():
     
     # Daemon command
     daemon_parser = subparsers.add_parser("daemon", help="Run DittoFS daemon")
-    daemon_parser.add_argument("--port", type=int, help="TCP port to use")
     
     # Add command  
     add_parser = subparsers.add_parser("add", help="Add file to DittoFS")
@@ -374,19 +318,11 @@ def build_parser():
     
     # Sync command
     sync_parser = subparsers.add_parser("sync", help="Sync with peers")
-    sync_parser.add_argument("--peer-id", help="Sync with specific peer")
     sync_parser.add_argument("--timeout", type=float, default=10.0,
                             help="Discovery timeout")
     
     # Status command
     status_parser = subparsers.add_parser("status", help="Show status")
-    
-    # Mount command
-    mount_parser = subparsers.add_parser("mount", help="Mount as filesystem")
-    mount_parser.add_argument("mountpoint", help="Mount point directory")
-    
-    # Tray command
-    tray_parser = subparsers.add_parser("tray", help="Start GUI tray")
     
     return parser
 
@@ -409,12 +345,7 @@ async def async_main():
         "get": cli.cmd_get,
         "sync": cli.cmd_sync,
         "status": cli.cmd_status,
-        "mount": cli.cmd_mount,
     }
-    
-    if args.command == "tray":
-        # GUI command is synchronous
-        return cli.cmd_tray(args)
     
     if args.command in command_map:
         try:

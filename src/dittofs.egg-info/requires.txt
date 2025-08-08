@@ -1,0 +1,7 @@
+pyfuse3>=3.2
+trio
+blake3
+bleak<0.20.0
+bless
+pycrdt
+qrcode
