@@ -1,4 +1,3 @@
-README_CONTENT = """
 # DittoFS - Distributed Offline File System
 
 DittoFS is a distributed file system that allows you to share files across devices without requiring a central server. It uses Conflict-free Replicated Data Types (CRDTs) to ensure consistency and supports various transport mechanisms including TCP/mDNS, Bluetooth, and WebRTC.
