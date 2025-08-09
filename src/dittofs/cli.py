@@ -7,10 +7,9 @@ import signal
 import time
 from typing import Optional
 from .crdt_store import CRDTStore
-from .sync_mannager import SyncManager,run_dittofs_daemon
+from .sync_manager import SyncManager, run_dittofs_daemon  # Fixed import
 from .transport import TransportManager
 from .chunker import split, join
-from .hello_dittofs import HelloFS
 
 # For GUI (optional)
 try:
@@ -27,9 +26,6 @@ try:
 except ImportError:
     FUSE_AVAILABLE = False
     logging.warning("FUSE not available - install pyfuse3 for mounting")
-
-import argparse
-import sys
 
 class DittoFSCLI:
     """Fixed CLI application"""
@@ -48,6 +44,8 @@ class DittoFSCLI:
                 self.sync_manager = SyncManager(self.store, self.transport)
             except Exception as e:
                 print(f"Failed to initialize components: {e}")
+                import traceback
+                traceback.print_exc()
                 return False
         return True
     
@@ -130,6 +128,9 @@ class DittoFSCLI:
                         
         except Exception as e:
             print(f"Error listing files: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
             return 1
         
         return 0
@@ -186,6 +187,9 @@ class DittoFSCLI:
             
         except Exception as e:
             print(f"Error reconstructing file: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
             return 1
     
     async def cmd_sync(self, args):
@@ -237,6 +241,9 @@ class DittoFSCLI:
             
         except Exception as e:
             print(f"Sync error: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
             return 1
     
     async def cmd_status(self, args):
@@ -277,6 +284,9 @@ class DittoFSCLI:
                     
         except Exception as e:
             print(f"Status error: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
             return 1
         
         return 0
@@ -334,6 +344,12 @@ async def async_main():
     if not args.command:
         parser.print_help()
         return 1
+    
+    # Set up logging
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
     
     cli = DittoFSCLI()
     
