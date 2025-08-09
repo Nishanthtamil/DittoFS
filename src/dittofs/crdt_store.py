@@ -41,20 +41,40 @@ class CRDTStore:
         
         # Initialize CRDT document
         self.doc = Y.Doc()
-        self.root = Y.Map()
-        self.doc["root"] = self.root
         
-        # Initialize files and chunks maps if they don't exist
-        if "files" not in self.root:
-            self.root["files"] = Y.Map()
-        if "chunks" not in self.root:
-            self.root["chunks"] = Y.Map()
-        
-        self.files_map = self.root["files"]
-        self.chunks_map = self.root["chunks"]
-        
-        # Load existing data
+        # Load existing data first
         self._load()
+        
+        # Initialize maps - create them if they don't exist
+        self._ensure_maps_exist()
+    
+    def _ensure_maps_exist(self):
+        """Ensure root, files, and chunks maps exist"""
+        try:
+            # Get or create root map using the correct pycrdt API
+            self.root = self.doc.get("root", type=Y.Map)
+            
+            # Get or create files map - Map.get() works like dict.get()
+            self.files_map = self.root.get("files")
+            if self.files_map is None:
+                self.files_map = Y.Map()
+                self.root["files"] = self.files_map
+            
+            # Get or create chunks map
+            self.chunks_map = self.root.get("chunks")
+            if self.chunks_map is None:
+                self.chunks_map = Y.Map()
+                self.root["chunks"] = self.chunks_map
+            
+        except Exception as e:
+            logging.error(f"Error ensuring maps exist: {e}")
+            # Fallback: create new maps
+            self.root = Y.Map()
+            self.files_map = Y.Map()
+            self.chunks_map = Y.Map()
+            self.doc["root"] = self.root
+            self.root["files"] = self.files_map
+            self.root["chunks"] = self.chunks_map
     
     def add_file(self, file_path: pathlib.Path, hashes: List[str]) -> bool:
         """Add or update a file record"""
@@ -85,22 +105,27 @@ class CRDTStore:
             
             # Track chunk ownership
             for chunk_hash in hashes:
-                chunk_owners = self.chunks_map.get(chunk_hash, [])
-                if isinstance(chunk_owners, str):
-                    # Handle legacy single owner format
-                    chunk_owners = [chunk_owners]
-                elif not isinstance(chunk_owners, list):
-                    chunk_owners = []
-                
-                if record.path not in chunk_owners:
-                    chunk_owners.append(record.path)
-                    self.chunks_map[chunk_hash] = chunk_owners
+                try:
+                    chunk_owners = self.chunks_map.get(chunk_hash, [])
+                    if isinstance(chunk_owners, str):
+                        # Handle legacy single owner format
+                        chunk_owners = [chunk_owners]
+                    elif not isinstance(chunk_owners, list):
+                        chunk_owners = []
+                    
+                    if record.path not in chunk_owners:
+                        chunk_owners.append(record.path)
+                        self.chunks_map[chunk_hash] = chunk_owners
+                except Exception as e:
+                    logging.warning(f"Failed to update chunk ownership for {chunk_hash}: {e}")
             
             logging.info(f"Added file: {record.path} with {len(hashes)} chunks")
             return True
             
         except Exception as e:
             logging.error(f"Failed to add file {file_path}: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def get_file(self, file_path: pathlib.Path) -> Optional[FileRecord]:
@@ -147,19 +172,23 @@ class CRDTStore:
     
     def find_chunk_owners(self, chunk_hash: str) -> List[str]:
         """Find which files contain this chunk"""
-        owners = self.chunks_map.get(chunk_hash, [])
-        if isinstance(owners, str):
-            return [owners]
-        elif isinstance(owners, list):
-            return owners
-        else:
+        try:
+            owners = self.chunks_map.get(chunk_hash, [])
+            if isinstance(owners, str):
+                return [owners]
+            elif isinstance(owners, list):
+                return owners
+            else:
+                return []
+        except Exception as e:
+            logging.error(f"Error finding chunk owners for {chunk_hash}: {e}")
             return []
     
     def merge_updates(self, update_data: bytes) -> bool:
         """Merge updates from remote peer"""
         try:
-            # Apply the update to our document
-            Y.apply_update(self.doc, update_data)
+            # Use the correct pycrdt API - apply_update on the document
+            self.doc.apply_update(update_data)
             logging.info("Successfully merged CRDT update")
             return True
             
@@ -186,7 +215,8 @@ class CRDTStore:
     def save(self) -> bool:
         """Save the CRDT document to disk"""
         try:
-            update_data = self.doc.get_state()
+            # Get the current document state as bytes (full update from creation)
+            update_data = self.doc.get_update()
             with open(self.store_path, 'wb') as f:
                 f.write(update_data)
             logging.debug(f"Saved CRDT store to {self.store_path}")
@@ -202,13 +232,14 @@ class CRDTStore:
                 with open(self.store_path, 'rb') as f:
                     update_data = f.read()
                     if update_data:
-                        Y.merge_updates([update_data], self.doc)
-                        # Re-get the maps after loading
-                        self.root = self.doc.get("root", Y.Map())
-                        self.files_map = self.root.get("files", Y.Map())
-                        self.chunks_map = self.root.get("chunks", Y.Map())
+                        # Use the doc.apply_update() method instead of Y.merge_updates
+                        self.doc.apply_update(update_data)
                         logging.debug(f"Loaded CRDT store from {self.store_path}")
+                        # Re-ensure maps exist after loading
+                        self._ensure_maps_exist()
             return True
         except Exception as e:
             logging.error(f"Failed to load CRDT store: {e}")
+            # If loading fails, continue with empty document
+            logging.info("Starting with empty CRDT document")
             return False

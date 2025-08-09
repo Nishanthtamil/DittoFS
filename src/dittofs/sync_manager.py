@@ -375,7 +375,7 @@ async def run_dittofs_daemon():
         # Start transports
         if not await transport.start_all():
             logging.error("Failed to start any transport")
-            return
+            return 1
         
         logging.info("DittoFS daemon started successfully")
         
@@ -383,34 +383,6 @@ async def run_dittofs_daemon():
         async def handle_new_connection(connection):
             """Handle new incoming connection"""
             asyncio.create_task(handler.handle_connection(connection))
-        
-        # Monkey-patch the TCP transport to use our handler
-        original_accept = transport.transports['tcp']._accept_connections
-        
-        async def enhanced_accept():
-            loop = asyncio.get_event_loop()
-            tcp_transport = transport.transports['tcp']
-            
-            while tcp_transport.is_running:
-                try:
-                    client_socket, addr = await loop.sock_accept(tcp_transport.server_socket)
-                    from .transport import TCPConnection
-                    conn = TCPConnection(client_socket)
-                    tcp_transport.connections.append(conn)
-                    
-                    # Handle connection in background
-                    asyncio.create_task(handler.handle_connection(conn))
-                    logging.info(f"New connection from {addr}")
-                    
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    if tcp_transport.is_running:
-                        logging.error(f"Error accepting connection: {e}")
-                    await asyncio.sleep(1)
-        
-        # Replace the accept method
-        transport.transports['tcp']._accept_connections = enhanced_accept
         
         # Start sync daemon
         sync_task = asyncio.create_task(sync_manager.start_sync_daemon())
