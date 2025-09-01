@@ -13,10 +13,10 @@ try:
     from .chunker import Chunker
     from .crdt_store import CRDTStore
     from .sync_manager import SyncManager
-    
+
     __all__ = [
         "Chunker",
-        "CRDTStore", 
+        "CRDTStore",
         "SyncManager",
         "__version__",
     ]

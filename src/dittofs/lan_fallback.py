@@ -1,13 +1,16 @@
 import socket
-from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
+
+from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
 SERVICE_TYPE = "_dittofs._tcp.local."
 PORT = 8765
+
 
 class LANTransport:
     def serve(self, payload: bytes):
         # advertise via mDNS (blocking)
         from zeroconf import ServiceInfo, Zeroconf
+
         info = ServiceInfo(
             SERVICE_TYPE,
             f"DittoFS-{socket.gethostname()}._dittofs._tcp.local.",
@@ -42,6 +45,7 @@ class LANTransport:
         zc = Zeroconf()
         browser = ServiceBrowser(zc, SERVICE_TYPE, Listener())
         import time
+
         time.sleep(min(timeout, 2))  # quick scan
         zc.close()
         if not found:

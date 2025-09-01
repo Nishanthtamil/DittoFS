@@ -1,12 +1,16 @@
-import asyncio, errno, stat
-import pyfuse3, trio,sys
+import asyncio
+import errno
+import stat
+import sys
+
+import pyfuse3
+import trio
+
 
 class HelloFS(pyfuse3.Operations):
     def __init__(self):
         super().__init__()
-        self.files = {
-            1: pyfuse3.EntryAttributes()  # root
-        }
+        self.files = {1: pyfuse3.EntryAttributes()}  # root
         self.files[1].st_mode = stat.S_IFDIR | 0o755
         self.files[1].st_size = 0
         self.files[1].st_ino = 1
@@ -20,7 +24,7 @@ class HelloFS(pyfuse3.Operations):
         return self.files[inode]
 
     async def lookup(self, parent_inode, name, ctx):
-        if parent_inode == 1 and name == b'hello.txt':
+        if parent_inode == 1 and name == b"hello.txt":
             return self.files[2]
         raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -30,10 +34,12 @@ class HelloFS(pyfuse3.Operations):
         return pyfuse3.FileInfo(fh=2)
 
     async def read(self, fh, off, size):
-        return b'Hello Ditto\n'[off:off+size]
+        return b"Hello Ditto\n"[off : off + size]
+
 
 async def main():
     import sys
+
     if len(sys.argv) != 2:
         print("Usage: python hello_dittofs.py <mountpoint>")
         sys.exit(1)
@@ -45,5 +51,6 @@ async def main():
     finally:
         pyfuse3.close(unmount=True)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     trio.run(main)

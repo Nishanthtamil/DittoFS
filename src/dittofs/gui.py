@@ -1,9 +1,21 @@
-import sys, pathlib, json
-from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QDialog,
-                             QVBoxLayout, QLabel, QLineEdit, QPushButton,
-                             QCheckBox)
-from PyQt6.QtCore import QTimer, QThread, pyqtSignal
-from PyQt6.QtGui import QIcon, QAction
+import json
+import pathlib
+import sys
+
+from PyQt6.QtCore import QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QDialog,
+    QLabel,
+    QLineEdit,
+    QMenu,
+    QPushButton,
+    QSystemTrayIcon,
+    QVBoxLayout,
+)
+
 
 class SettingsDialog(QDialog):
     def __init__(self):
@@ -24,6 +36,7 @@ class SettingsDialog(QDialog):
         save_btn = QPushButton("Save")
         save_btn.clicked.connect(self.accept)
         layout.addWidget(save_btn)
+
 
 class TrayApp(QApplication):
     def __init__(self):
@@ -55,11 +68,14 @@ class TrayApp(QApplication):
         self.settings = SettingsDialog()
 
     def open_folder(self):
-        import webbrowser, os
+        import os
+        import webbrowser
+
         webbrowser.open("file:///tmp/ditto")
 
     def show_settings(self):
         self.settings.show()
+
 
 if __name__ == "__main__":
     app = TrayApp()

@@ -11,15 +11,15 @@ import random
 import socket
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
-from unittest.mock import Mock, AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from hypothesis import strategies as st
 
-
 # ============================================================================
 # Test Data Generation
 # ============================================================================
+
 
 def generate_random_bytes(size: int, seed: Optional[int] = None) -> bytes:
     """Generate random bytes with optional seed for reproducibility."""
@@ -40,7 +40,7 @@ def generate_test_file_content(size: int, pattern: str = "random") -> bytes:
         return bytes([i % 256 for i in range(size)])
     elif pattern == "text":
         text = "Hello, DittoFS! This is a test file.\n" * (size // 40 + 1)
-        return text.encode('utf-8')[:size]
+        return text.encode("utf-8")[:size]
     else:
         raise ValueError(f"Unknown pattern: {pattern}")
 
@@ -56,10 +56,11 @@ def create_file_with_content(path: pathlib.Path, content: bytes) -> pathlib.Path
 # Network Utilities
 # ============================================================================
 
+
 def get_free_port() -> int:
     """Get a free port for testing."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
+        s.bind(("", 0))
         s.listen(1)
         port = s.getsockname()[1]
     return port
@@ -77,37 +78,38 @@ def get_multiple_free_ports(count: int) -> List[int]:
 # Async Test Utilities
 # ============================================================================
 
+
 async def wait_for_condition(
-    condition: Callable[[], Union[bool, Any]], 
-    timeout: float = 5.0, 
+    condition: Callable[[], Union[bool, Any]],
+    timeout: float = 5.0,
     interval: float = 0.1,
-    message: str = "Condition not met"
+    message: str = "Condition not met",
 ) -> bool:
     """Wait for a condition to become true."""
     start_time = time.time()
-    
+
     while time.time() - start_time < timeout:
         try:
             if asyncio.iscoroutinefunction(condition):
                 result = await condition()
             else:
                 result = condition()
-            
+
             if result:
                 return True
         except Exception:
             # Ignore exceptions during condition checking
             pass
-        
+
         await asyncio.sleep(interval)
-    
+
     raise TimeoutError(f"{message} (timeout after {timeout}s)")
 
 
 async def assert_eventually(
-    condition: Callable[[], Union[bool, Any]], 
+    condition: Callable[[], Union[bool, Any]],
     timeout: float = 5.0,
-    message: str = "Condition not met"
+    message: str = "Condition not met",
 ):
     """Assert that a condition eventually becomes true."""
     await wait_for_condition(condition, timeout, message=message)
@@ -115,17 +117,17 @@ async def assert_eventually(
 
 class AsyncContextManager:
     """Helper for creating async context managers in tests."""
-    
+
     def __init__(self, enter_result=None, exit_result=None):
         self.enter_result = enter_result
         self.exit_result = exit_result
         self.entered = False
         self.exited = False
-    
+
     async def __aenter__(self):
         self.entered = True
         return self.enter_result
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         self.exited = True
         return self.exit_result
@@ -134,6 +136,7 @@ class AsyncContextManager:
 # ============================================================================
 # File System Utilities
 # ============================================================================
+
 
 def assert_files_equal(file1: pathlib.Path, file2: pathlib.Path):
     """Assert that two files have identical content."""
@@ -145,13 +148,15 @@ def assert_files_equal(file1: pathlib.Path, file2: pathlib.Path):
 def assert_file_has_content(file_path: pathlib.Path, expected_content: bytes):
     """Assert that a file has specific content."""
     actual_content = file_path.read_bytes()
-    assert actual_content == expected_content, f"File {file_path} has unexpected content"
+    assert (
+        actual_content == expected_content
+    ), f"File {file_path} has unexpected content"
 
 
 def calculate_file_hash(file_path: pathlib.Path, algorithm: str = "sha256") -> str:
     """Calculate hash of a file."""
     hasher = hashlib.new(algorithm)
-    with open(file_path, 'rb') as f:
+    with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
@@ -159,7 +164,7 @@ def calculate_file_hash(file_path: pathlib.Path, algorithm: str = "sha256") -> s
 
 def create_directory_tree(base_path: pathlib.Path, structure: Dict[str, Any]):
     """Create a directory tree from a nested dictionary structure.
-    
+
     Args:
         base_path: Base directory to create structure in
         structure: Dict where keys are names and values are either:
@@ -167,10 +172,10 @@ def create_directory_tree(base_path: pathlib.Path, structure: Dict[str, Any]):
             - dict: create subdirectory with this structure
     """
     base_path.mkdir(parents=True, exist_ok=True)
-    
+
     for name, content in structure.items():
         path = base_path / name
-        
+
         if isinstance(content, bytes):
             # Create file
             path.write_bytes(content)
@@ -185,20 +190,21 @@ def create_directory_tree(base_path: pathlib.Path, structure: Dict[str, Any]):
 # Mock Utilities
 # ============================================================================
 
+
 class MockAsyncIterator:
     """Mock async iterator for testing."""
-    
+
     def __init__(self, items: List[Any]):
         self.items = items
         self.index = 0
-    
+
     def __aiter__(self):
         return self
-    
+
     async def __anext__(self):
         if self.index >= len(self.items):
             raise StopAsyncIteration
-        
+
         item = self.items[self.index]
         self.index += 1
         return item
@@ -207,15 +213,15 @@ class MockAsyncIterator:
 def create_mock_with_async_methods(spec=None, **kwargs) -> Mock:
     """Create a mock with async methods."""
     mock = Mock(spec=spec, **kwargs)
-    
+
     # Make all methods async by default
     if spec:
         for attr_name in dir(spec):
-            if not attr_name.startswith('_'):
+            if not attr_name.startswith("_"):
                 attr = getattr(spec, attr_name)
                 if callable(attr):
                     setattr(mock, attr_name, AsyncMock())
-    
+
     return mock
 
 
@@ -231,12 +237,11 @@ large_file_content = st.binary(min_size=64 * 1024, max_size=5 * 64 * 1024)
 # File name strategies
 valid_filename = st.text(
     alphabet=st.characters(
-        whitelist_categories=("Lu", "Ll", "Nd"), 
-        whitelist_characters=".-_"
+        whitelist_categories=("Lu", "Ll", "Nd"), whitelist_characters=".-_"
     ),
     min_size=1,
-    max_size=100
-).filter(lambda x: not x.startswith('.') and '/' not in x and '\\' not in x)
+    max_size=100,
+).filter(lambda x: not x.startswith(".") and "/" not in x and "\\" not in x)
 
 # Network strategies
 port_number = st.integers(min_value=1024, max_value=65535)
@@ -245,30 +250,25 @@ ip_address = st.builds(
     st.integers(min_value=0, max_value=255),
     st.integers(min_value=0, max_value=255),
     st.integers(min_value=0, max_value=255),
-    st.integers(min_value=0, max_value=255)
+    st.integers(min_value=0, max_value=255),
 )
 
 # Peer ID strategies
 peer_id = st.text(
     alphabet=st.characters(
-        whitelist_categories=("Lu", "Ll", "Nd"), 
-        whitelist_characters="-_"
+        whitelist_categories=("Lu", "Ll", "Nd"), whitelist_characters="-_"
     ),
     min_size=1,
-    max_size=50
+    max_size=50,
 )
 
 # Hash strategies (for chunk hashes)
-chunk_hash = st.text(
-    alphabet="0123456789abcdef",
-    min_size=64,
-    max_size=64
-)
+chunk_hash = st.text(alphabet="0123456789abcdef", min_size=64, max_size=64)
 
 # Time strategies
 timestamp = st.floats(
     min_value=time.time() - 365 * 24 * 3600,  # One year ago
-    max_value=time.time() + 365 * 24 * 3600   # One year from now
+    max_value=time.time() + 365 * 24 * 3600,  # One year from now
 )
 
 
@@ -276,22 +276,23 @@ timestamp = st.floats(
 # Performance Testing Utilities
 # ============================================================================
 
+
 class PerformanceTimer:
     """Context manager for measuring execution time."""
-    
+
     def __init__(self):
         self.start_time = None
         self.end_time = None
         self.duration = None
-    
+
     def __enter__(self):
         self.start_time = time.perf_counter()
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.end_time = time.perf_counter()
         self.duration = self.end_time - self.start_time
-    
+
     @property
     def elapsed(self) -> float:
         """Get elapsed time in seconds."""
@@ -307,6 +308,7 @@ def measure_memory_usage():
     """Measure current memory usage (requires psutil)."""
     try:
         import psutil
+
         process = psutil.Process()
         return process.memory_info().rss
     except ImportError:
@@ -317,11 +319,18 @@ def measure_memory_usage():
 # Security Testing Utilities
 # ============================================================================
 
+
 def generate_weak_password() -> str:
     """Generate a weak password for security testing."""
     weak_passwords = [
-        "password", "123456", "admin", "test", "qwerty",
-        "password123", "admin123", "test123"
+        "password",
+        "123456",
+        "admin",
+        "test",
+        "qwerty",
+        "password123",
+        "admin123",
+        "test123",
     ]
     return random.choice(weak_passwords)
 
@@ -329,8 +338,9 @@ def generate_weak_password() -> str:
 def generate_strong_password(length: int = 16) -> str:
     """Generate a strong password for testing."""
     import string
+
     chars = string.ascii_letters + string.digits + "!@#$%^&*"
-    return ''.join(random.choice(chars) for _ in range(length))
+    return "".join(random.choice(chars) for _ in range(length))
 
 
 def create_test_certificate_data() -> Dict[str, bytes]:
@@ -340,7 +350,7 @@ def create_test_certificate_data() -> Dict[str, bytes]:
     return {
         "private_key": b"fake_private_key_data",
         "public_key": b"fake_public_key_data",
-        "certificate": b"fake_certificate_data"
+        "certificate": b"fake_certificate_data",
     }
 
 
@@ -348,27 +358,30 @@ def create_test_certificate_data() -> Dict[str, bytes]:
 # Logging and Debug Utilities
 # ============================================================================
 
+
 class TestLogCapture:
     """Capture log messages during testing."""
-    
+
     def __init__(self):
         self.messages = []
-    
+
     def capture(self, record):
         """Capture a log record."""
-        self.messages.append({
-            'level': record.levelname,
-            'message': record.getMessage(),
-            'module': record.module,
-            'timestamp': record.created
-        })
-    
+        self.messages.append(
+            {
+                "level": record.levelname,
+                "message": record.getMessage(),
+                "module": record.module,
+                "timestamp": record.created,
+            }
+        )
+
     def get_messages(self, level: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get captured messages, optionally filtered by level."""
         if level is None:
             return self.messages.copy()
-        return [msg for msg in self.messages if msg['level'] == level]
-    
+        return [msg for msg in self.messages if msg["level"] == level]
+
     def clear(self):
         """Clear captured messages."""
         self.messages.clear()
@@ -377,5 +390,6 @@ class TestLogCapture:
 def debug_print(*args, **kwargs):
     """Debug print that only prints if PYTEST_DEBUG is set."""
     import os
-    if os.environ.get('PYTEST_DEBUG'):
+
+    if os.environ.get("PYTEST_DEBUG"):
         print(*args, **kwargs)
