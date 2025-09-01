@@ -1,0 +1,31 @@
+# Core dependencies
+pycrdt>=0.8.0
+blake3>=0.3.0
+zeroconf>=0.100.0
+
+# Optional dependencies
+
+
+# For GUI support:
+PyQt6>=6.0.0
+
+# For FUSE filesystem support:
+pyfuse3>=3.0.0
+trio>=0.22.0
+
+# For Bluetooth transport:
+bleak>=0.20.0
+
+# For WebRTC transport:
+aiortc>=1.6.0
+websockets>=11.0
+
+# For MQTT transport:
+asyncio-mqtt>=0.13.0
+
+# Development dependencies:
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.0.0

@@ -1,0 +1,199 @@
+name: Dependency Updates
+
+on:
+  schedule:
+    # Run weekly on Mondays at 9 AM UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  update-dependencies:
+    name: Update Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install pip-tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-tools pip-audit safety
+      
+      - name: Check current dependencies for vulnerabilities
+        run: |
+          pip install -e .[dev,all]
+          pip-audit --format=json --output=pre-update-audit.json
+          safety check --json --output=pre-update-safety.json
+        continue-on-error: true
+      
+      - name: Update dependencies
+        run: |
+          # Create requirements files from pyproject.toml
+          pip-compile --upgrade --resolver=backtracking pyproject.toml
+          
+          # Check if there are any updates
+          if git diff --quiet; then
+            echo "No dependency updates available"
+            echo "UPDATES_AVAILABLE=false" >> $GITHUB_ENV
+          else
+            echo "Dependency updates found"
+            echo "UPDATES_AVAILABLE=true" >> $GITHUB_ENV
+          fi
+      
+      - name: Test updated dependencies
+        if: env.UPDATES_AVAILABLE == 'true'
+        run: |
+          pip install -e .[dev,all]
+          python -m pytest tests/ -m "unit" --maxfail=5 --tb=short
+      
+      - name: Check updated dependencies for vulnerabilities
+        if: env.UPDATES_AVAILABLE == 'true'
+        run: |
+          pip-audit --format=json --output=post-update-audit.json
+          safety check --json --output=post-update-safety.json
+        continue-on-error: true
+      
+      - name: Generate update summary
+        if: env.UPDATES_AVAILABLE == 'true'
+        run: |
+          echo "# 📦 Dependency Update Summary" > update-summary.md
+          echo "" >> update-summary.md
+          echo "**Update Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> update-summary.md
+          echo "" >> update-summary.md
+          
+          echo "## Changed Dependencies" >> update-summary.md
+          echo "" >> update-summary.md
+          echo '```diff' >> update-summary.md
+          git diff requirements.txt >> update-summary.md || echo "No requirements.txt changes" >> update-summary.md
+          echo '```' >> update-summary.md
+          echo "" >> update-summary.md
+          
+          echo "## Security Impact" >> update-summary.md
+          echo "" >> update-summary.md
+          
+          # Compare vulnerability counts
+          if [ -f pre-update-audit.json ] && [ -f post-update-audit.json ]; then
+            PRE_VULNS=$(python -c "import json; data=json.load(open('pre-update-audit.json')); print(len(data.get('vulnerabilities', [])))" 2>/dev/null || echo "0")
+            POST_VULNS=$(python -c "import json; data=json.load(open('post-update-audit.json')); print(len(data.get('vulnerabilities', [])))" 2>/dev/null || echo "0")
+            
+            echo "- Vulnerabilities before update: $PRE_VULNS" >> update-summary.md
+            echo "- Vulnerabilities after update: $POST_VULNS" >> update-summary.md
+            
+            if [ "$POST_VULNS" -lt "$PRE_VULNS" ]; then
+              echo "- ✅ Security improved: $(($PRE_VULNS - $POST_VULNS)) vulnerabilities fixed" >> update-summary.md
+            elif [ "$POST_VULNS" -gt "$PRE_VULNS" ]; then
+              echo "- ⚠️ Security degraded: $(($POST_VULNS - $PRE_VULNS)) new vulnerabilities introduced" >> update-summary.md
+            else
+              echo "- ➡️ Security status unchanged" >> update-summary.md
+            fi
+          fi
+          
+          echo "" >> update-summary.md
+          echo "## Testing Results" >> update-summary.md
+          echo "" >> update-summary.md
+          echo "- Unit tests: ✅ Passed" >> update-summary.md
+          echo "- Dependency audit: ✅ Completed" >> update-summary.md
+          echo "" >> update-summary.md
+          echo "## Next Steps" >> update-summary.md
+          echo "" >> update-summary.md
+          echo "1. Review the changes in this PR" >> update-summary.md
+          echo "2. Run full test suite if needed" >> update-summary.md
+          echo "3. Merge if all checks pass" >> update-summary.md
+      
+      - name: Create Pull Request
+        if: env.UPDATES_AVAILABLE == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: update dependencies"
+          title: "🔄 Automated Dependency Updates"
+          body-path: update-summary.md
+          branch: dependency-updates
+          delete-branch: true
+          labels: |
+            dependencies
+            automated
+            security
+          reviewers: |
+            # Add repository maintainers here
+          assignees: |
+            # Add repository maintainers here
+      
+      - name: Upload dependency reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-update-reports
+          path: |
+            pre-update-*.json
+            post-update-*.json
+            update-summary.md
+            requirements*.txt
+          retention-days: 30
+
+  check-outdated:
+    name: Check Outdated Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev,all]
+      
+      - name: Check for outdated packages
+        run: |
+          pip list --outdated --format=json > outdated-packages.json
+          
+          # Generate human-readable report
+          echo "# 📊 Outdated Dependencies Report" > outdated-report.md
+          echo "" >> outdated-report.md
+          echo "**Report Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> outdated-report.md
+          echo "" >> outdated-report.md
+          
+          OUTDATED_COUNT=$(python -c "import json; data=json.load(open('outdated-packages.json')); print(len(data))")
+          
+          if [ "$OUTDATED_COUNT" -eq 0 ]; then
+            echo "✅ All dependencies are up to date!" >> outdated-report.md
+          else
+            echo "⚠️ Found $OUTDATED_COUNT outdated dependencies:" >> outdated-report.md
+            echo "" >> outdated-report.md
+            echo "| Package | Current | Latest | Type |" >> outdated-report.md
+            echo "|---------|---------|--------|------|" >> outdated-report.md
+            
+            python -c "
+            import json
+            data = json.load(open('outdated-packages.json'))
+            for pkg in data:
+                print(f\"| {pkg['name']} | {pkg['version']} | {pkg['latest_version']} | {pkg.get('latest_filetype', 'wheel')} |\")
+            " >> outdated-report.md
+          fi
+      
+      - name: Upload outdated packages report
+        uses: actions/upload-artifact@v4
+        with:
+          name: outdated-dependencies-report
+          path: |
+            outdated-packages.json
+            outdated-report.md
+          retention-days: 30

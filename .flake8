@@ -1,0 +1,87 @@
+# Flake8 configuration for DittoFS
+[flake8]
+# Maximum line length
+max-line-length = 88
+
+# Exclude directories and files
+exclude = 
+    .git,
+    __pycache__,
+    .pytest_cache,
+    .mypy_cache,
+    .tox,
+    .venv,
+    venv,
+    build,
+    dist,
+    *.egg-info,
+    htmlcov,
+    .ditto,
+    packaging
+
+# Error codes to ignore
+ignore = 
+    # E203: whitespace before ':' (conflicts with black)
+    E203,
+    # E501: line too long (handled by black)
+    E501,
+    # W503: line break before binary operator (conflicts with black)
+    W503,
+    # E231: missing whitespace after ',' (handled by black)
+    E231
+
+# Error codes to always check
+select = 
+    E,  # pycodestyle errors
+    W,  # pycodestyle warnings
+    F,  # pyflakes
+    C,  # mccabe complexity
+    B,  # flake8-bugbear
+    I,  # isort
+
+# Maximum complexity
+max-complexity = 12
+
+# Per-file ignores
+per-file-ignores = 
+    # Tests can have longer lines and more complex functions
+    tests/*:E501,C901,F401,F811
+    # Example/demo code can be less strict
+    */hello_dittofs.py:E501,F401
+    # CLI module can have higher complexity
+    src/dittofs/cli.py:C901
+    # GUI module can have higher complexity due to UI setup
+    src/dittofs/gui.py:C901
+
+# Import order style
+import-order-style = google
+
+# Show source code for each error
+show-source = True
+
+# Show pep8 violation statistics
+statistics = True
+
+# Count errors and warnings
+count = True
+
+# Format for error messages
+format = %(path)s:%(row)d:%(col)d: %(code)s %(text)s
+
+# Enable additional checks
+enable-extensions = 
+    B,  # flake8-bugbear
+    C,  # mccabe
+    I,  # isort
+
+# Docstring conventions
+docstring-convention = google
+
+# Inline quotes preference
+inline-quotes = double
+
+# Multiline quotes preference  
+multiline-quotes = double
+
+# Avoid escape sequences in docstrings
+avoid-escape = True

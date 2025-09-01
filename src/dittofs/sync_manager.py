@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from .transport import TransportManager, Connection
 from .crdt_store import CRDTStore, FileRecord
+from .integrity import IntegrityVerifier, IntegrityScheduler
 
 @dataclass
 class ChunkRequest:
@@ -17,7 +18,7 @@ class ChunkRequest:
     timestamp: float
 
 class SyncManager:
-    """Fixed synchronization manager"""
+    """Fixed synchronization manager with integrity verification"""
     
     def __init__(self, store: CRDTStore, transport_manager: TransportManager):
         self.store = store
@@ -27,9 +28,22 @@ class SyncManager:
         self.peer_id = f"dittofs-{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}"
         self.is_running = False
         
+        # Initialize integrity verification
+        self.integrity_verifier = IntegrityVerifier(store)
+        self.integrity_scheduler = IntegrityScheduler(self.integrity_verifier)
+        
+        # Register this sync manager as a peer provider for chunk repair
+        self.integrity_verifier.register_peer_provider(
+            "sync_manager", self._get_chunk_from_peers
+        )
+        
     async def start_sync_daemon(self):
         """Start the background sync process"""
         self.is_running = True
+        
+        # Start integrity verification scheduler
+        await self.integrity_scheduler.start()
+        
         await self._sync_loop()
     
     async def _sync_loop(self):
@@ -262,6 +276,36 @@ class SyncManager:
         except Exception as e:
             logging.error(f"Failed to handle chunk response: {e}")
     
+    async def handle_integrity_check_request(self, connection: Connection, message: dict):
+        """Handle request for integrity check of specific chunks"""
+        try:
+            chunk_hashes = message.get("chunk_hashes", [])
+            requester_id = message.get("requester_id", "unknown")
+            
+            if not chunk_hashes:
+                return
+            
+            # Verify requested chunks
+            verification_results = {}
+            for chunk_hash in chunk_hashes[:10]:  # Limit to 10 chunks per request
+                is_valid, report = await self.integrity_verifier.verify_chunk(chunk_hash)
+                verification_results[chunk_hash] = {
+                    "valid": is_valid,
+                    "error": report.error_message if report else None
+                }
+            
+            # Send response
+            await connection.send_message({
+                "type": "integrity_check_response",
+                "requester_id": self.peer_id,
+                "verification_results": verification_results
+            })
+            
+            logging.info(f"Handled integrity check request from {requester_id} for {len(chunk_hashes)} chunks")
+            
+        except Exception as e:
+            logging.error(f"Failed to handle integrity check request: {e}")
+    
     async def handle_message(self, connection: Connection, message: dict):
         """Handle incoming messages"""
         message_type = message.get("type")
@@ -273,6 +317,8 @@ class SyncManager:
                 await self.handle_chunk_request(connection, message)
             elif message_type == "chunk_response":
                 await self.handle_chunk_response(connection, message)
+            elif message_type == "integrity_check_request":
+                await self.handle_integrity_check_request(connection, message)
             elif message_type == "sync_update":
                 # Handle sync update
                 if "update_data" in message and message["update_data"]:
@@ -300,19 +346,67 @@ class SyncManager:
             logging.error(f"Force sync with {peer_id} failed: {e}")
         return False
     
+    async def _get_chunk_from_peers(self, chunk_hash: str) -> Optional[bytes]:
+        """Get chunk data from peers for integrity repair"""
+        try:
+            peers = await self.transport.discover_all_peers(timeout=2.0)
+            
+            for peer in peers:
+                try:
+                    connection = await self.transport.connect_best_peer(peer.peer_id)
+                    if connection:
+                        # Request the chunk
+                        await connection.send_message({
+                            "type": "chunk_request",
+                            "chunk_hash": chunk_hash,
+                            "requester_id": self.peer_id
+                        })
+                        
+                        # Wait for response
+                        response = await connection.receive_message(timeout=10.0)
+                        await connection.close()
+                        
+                        if (response and 
+                            response.get("type") == "chunk_response" and
+                            response.get("chunk_hash") == chunk_hash):
+                            
+                            chunk_data_hex = response.get("chunk_data")
+                            if chunk_data_hex:
+                                return bytes.fromhex(chunk_data_hex)
+                        
+                except Exception as e:
+                    logging.debug(f"Failed to get chunk from peer {peer.peer_id}: {e}")
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Failed to get chunk {chunk_hash} from peers: {e}")
+            return None
+    
     async def get_sync_status(self) -> dict:
         """Get current sync status"""
+        integrity_stats = self.integrity_verifier.stats.to_dict()
+        corruption_summary = self.integrity_verifier.get_corruption_summary()
+        repair_summary = self.integrity_verifier.get_repair_summary()
+        
         return {
             "peer_id": self.peer_id,
             "active_syncs": len(self.sync_tasks),
             "pending_chunk_requests": len(self.chunk_requests),
             "missing_chunks": len(self.store.get_missing_chunks()),
-            "total_files": len(self.store.list_files())
+            "total_files": len(self.store.list_files()),
+            "integrity_stats": integrity_stats,
+            "corruption_summary": corruption_summary,
+            "repair_summary": repair_summary
         }
     
     async def stop(self):
         """Stop the sync manager"""
         self.is_running = False
+        
+        # Stop integrity verification scheduler
+        await self.integrity_scheduler.stop()
         
         # Cancel all sync tasks
         for task in self.sync_tasks.values():

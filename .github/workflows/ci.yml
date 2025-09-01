@@ -1,12 +1,507 @@
-name: CI
-on: [push]
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run security scans daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  PYTHON_VERSION: '3.11'
+  CACHE_VERSION: v1
+
 jobs:
-  build:
+  # Stage 1: Code Quality and Linting
+  code-quality:
+    name: Code Quality Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: sudo apt-get install libfuse3-dev
-      - run: pip install pyfuse3
-      - run: python -m pytest tests/ || true   # stub for now
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ env.CACHE_VERSION }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ env.CACHE_VERSION }}-
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      
+      - name: Run Black (code formatting check)
+        run: |
+          black --check --diff src/ tests/
+          echo "✅ Black formatting check passed"
+      
+      - name: Run Flake8 (linting)
+        run: |
+          flake8 src/ tests/ --statistics --tee --output-file=flake8-report.txt
+          echo "✅ Flake8 linting passed"
+      
+      - name: Run MyPy (type checking)
+        run: |
+          mypy src/ --html-report mypy-report --txt-report mypy-report
+          echo "✅ MyPy type checking passed"
+      
+      - name: Upload code quality reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: code-quality-reports
+          path: |
+            flake8-report.txt
+            mypy-report/
+          retention-days: 30
+
+  # Stage 2: Security Scanning
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install security scanning tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit[toml] safety pip-audit semgrep
+          pip install -e .[dev]
+      
+      - name: Run Bandit (security linting)
+        run: |
+          bandit -r src/ -f json -o bandit-report.json
+          bandit -r src/ -f txt -o bandit-report.txt
+          echo "✅ Bandit security scan completed"
+        continue-on-error: true
+      
+      - name: Run Safety (dependency vulnerability check)
+        run: |
+          safety check --json --output safety-report.json
+          safety check --output safety-report.txt
+          echo "✅ Safety dependency scan completed"
+        continue-on-error: true
+      
+      - name: Run pip-audit (dependency vulnerability scanning)
+        run: |
+          pip-audit --format=json --output=pip-audit-report.json
+          pip-audit --format=cyclonedx-json --output=pip-audit-sbom.json
+          pip-audit --output=pip-audit-report.txt
+          echo "✅ pip-audit vulnerability scan completed"
+        continue-on-error: true
+      
+      - name: Run Semgrep (static analysis)
+        run: |
+          semgrep --config=auto src/ --json --output=semgrep-report.json
+          semgrep --config=auto src/ --output=semgrep-report.txt
+          echo "✅ Semgrep static analysis completed"
+        continue-on-error: true
+      
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit-report.*
+            safety-report.*
+            pip-audit-report.*
+            pip-audit-sbom.json
+            semgrep-report.*
+          retention-days: 90
+
+  # Stage 3: Unit Tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: [code-quality]
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+        exclude:
+          # Reduce matrix size for faster CI
+          - os: windows-latest
+            python-version: '3.9'
+          - os: macos-latest
+            python-version: '3.9'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+      
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install macfuse
+      
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev,all]
+      
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ -m "unit" \
+            --cov=src/dittofs \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term-missing \
+            --junit-xml=junit-${{ matrix.os }}-${{ matrix.python-version }}.xml \
+            --verbose
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}-${{ matrix.python-version }}
+          path: |
+            junit-*.xml
+            htmlcov/
+            coverage.xml
+          retention-days: 30
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+  # Stage 4: Integration Tests
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [unit-tests]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+      
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev,all]
+      
+      - name: Run integration tests
+        run: |
+          python -m pytest tests/ -m "integration" \
+            --cov=src/dittofs \
+            --cov-report=xml \
+            --cov-report=html \
+            --junit-xml=junit-integration.xml \
+            --verbose \
+            --timeout=300
+      
+      - name: Upload integration test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: |
+            junit-integration.xml
+            htmlcov/
+            coverage.xml
+          retention-days: 30
+
+  # Stage 5: Property-Based and Security Tests
+  advanced-tests:
+    name: Advanced Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [unit-tests]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+      
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev,all]
+      
+      - name: Run property-based tests
+        run: |
+          python -m pytest tests/ -m "property" \
+            --junit-xml=junit-property.xml \
+            --verbose \
+            --timeout=300
+        env:
+          HYPOTHESIS_MAX_EXAMPLES: 100
+      
+      - name: Run security tests
+        run: |
+          python -m pytest tests/ -m "security" \
+            --junit-xml=junit-security.xml \
+            --verbose \
+            --timeout=300
+      
+      - name: Run crypto tests
+        run: |
+          python -m pytest tests/ -m "crypto" \
+            --junit-xml=junit-crypto.xml \
+            --verbose \
+            --timeout=300
+      
+      - name: Upload advanced test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: advanced-test-results
+          path: |
+            junit-*.xml
+          retention-days: 30
+
+  # Stage 6: Performance and Benchmark Tests
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [integration-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+      
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev,all]
+      
+      - name: Run benchmark tests
+        run: |
+          python -m pytest tests/ -m "benchmark" \
+            --benchmark-json=benchmark-results.json \
+            --junit-xml=junit-benchmark.xml \
+            --verbose
+      
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: |
+            benchmark-results.json
+            junit-benchmark.xml
+          retention-days: 90
+
+  # Stage 7: Build and Package
+  build-package:
+    name: Build Package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    needs: [integration-tests, advanced-tests]
+    
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+      
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install macfuse
+      
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel
+          pip install -e .[all]
+      
+      - name: Build package
+        run: |
+          python -m build
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: dist/
+          retention-days: 30
+
+  # Stage 8: Dependency Vulnerability Monitoring
+  dependency-check:
+    name: Dependency Vulnerability Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'schedule' || github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev,all]
+          pip install pip-audit safety
+      
+      - name: Generate dependency tree
+        run: |
+          pip list --format=json > pip-list.json
+          pip freeze > requirements-freeze.txt
+      
+      - name: Run comprehensive dependency audit
+        run: |
+          pip-audit --format=json --output=dependency-audit.json
+          pip-audit --format=cyclonedx-json --output=dependency-sbom.json
+          safety check --json --output=safety-audit.json
+        continue-on-error: true
+      
+      - name: Upload dependency reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-reports
+          path: |
+            pip-list.json
+            requirements-freeze.txt
+            dependency-audit.json
+            dependency-sbom.json
+            safety-audit.json
+          retention-days: 90
+
+  # Final Stage: Deployment Readiness Check
+  deployment-check:
+    name: Deployment Readiness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build-package, performance-tests, dependency-check]
+    if: always()
+    
+    steps:
+      - name: Check job results
+        run: |
+          echo "Code Quality: ${{ needs.code-quality.result }}"
+          echo "Security Scan: ${{ needs.security-scan.result }}"
+          echo "Unit Tests: ${{ needs.unit-tests.result }}"
+          echo "Integration Tests: ${{ needs.integration-tests.result }}"
+          echo "Advanced Tests: ${{ needs.advanced-tests.result }}"
+          echo "Build Package: ${{ needs.build-package.result }}"
+          
+          if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
+            echo "❌ Unit tests failed - deployment not ready"
+            exit 1
+          fi
+          
+          if [[ "${{ needs.integration-tests.result }}" != "success" ]]; then
+            echo "❌ Integration tests failed - deployment not ready"
+            exit 1
+          fi
+          
+          if [[ "${{ needs.build-package.result }}" != "success" ]]; then
+            echo "❌ Package build failed - deployment not ready"
+            exit 1
+          fi
+          
+          echo "✅ All critical checks passed - deployment ready"
+      
+      - name: Create deployment summary
+        run: |
+          echo "## 🚀 Deployment Readiness Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Code Quality | ${{ needs.code-quality.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | ${{ needs.security-scan.result == 'success' && '✅ Passed' || '⚠️ Check Required' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Tests | ${{ needs.unit-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Tests | ${{ needs.integration-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Advanced Tests | ${{ needs.advanced-tests.result == 'success' && '✅ Passed' || '⚠️ Check Required' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Package Build | ${{ needs.build-package.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY

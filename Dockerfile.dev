@@ -1,0 +1,84 @@
+# DittoFS Development Environment Dockerfile
+# This provides a consistent development environment across different systems
+
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Set working directory
+WORKDIR /workspace
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    # Build tools
+    build-essential \
+    gcc \
+    g++ \
+    make \
+    pkg-config \
+    # Development tools
+    git \
+    curl \
+    wget \
+    vim \
+    nano \
+    # FUSE support
+    libfuse3-dev \
+    fuse3 \
+    # Bluetooth support
+    bluetooth \
+    libbluetooth-dev \
+    bluez \
+    # Network tools
+    net-tools \
+    iputils-ping \
+    netcat-openbsd \
+    # Process tools
+    htop \
+    procps \
+    # Clean up
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for development
+RUN useradd -m -s /bin/bash -u 1000 developer && \
+    usermod -aG fuse developer
+
+# Install Python development tools globally
+RUN pip install --upgrade pip setuptools wheel
+
+# Copy requirements first for better caching
+COPY pyproject.toml ./
+COPY README.md ./
+
+# Install Python dependencies
+RUN pip install -e .[dev,all]
+
+# Copy source code
+COPY . .
+
+# Set ownership to developer user
+RUN chown -R developer:developer /workspace
+
+# Switch to non-root user
+USER developer
+
+# Install pre-commit hooks
+RUN pre-commit install || true
+
+# Create development directories
+RUN mkdir -p ~/.dittofs/dev/chunks
+
+# Expose common ports
+EXPOSE 8080 8081 8082
+
+# Set up development environment
+ENV PATH="/home/developer/.local/bin:$PATH"
+
+# Default command
+CMD ["/bin/bash"]
