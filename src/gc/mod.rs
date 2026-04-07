@@ -10,7 +10,8 @@ pub async fn start_gc_loop(store: Arc<ContextStore>) {
         sleep(Duration::from_secs(3600)).await;
         let keys = store.get_all_keys();
         for key in keys {
-            if let Some(doc) = store.get_doc(&key) {
+            if let Some(doc_lock) = store.get_doc(&key) {
+                let doc = doc_lock.read();
                 let _ = store.save_doc(&key, &doc);
             }
         }

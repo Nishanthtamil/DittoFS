@@ -19,10 +19,12 @@ pub struct DittoFS {
     pub inode_to_tree_id: RwLock<HashMap<u64, Option<TreeID>>>,
     pub tree_id_to_inode: RwLock<HashMap<Option<TreeID>, u64>>,
     pub next_inode: RwLock<u64>,
+    pub path_cache: RwLock<HashMap<String, Option<TreeID>>>,
+    pub local_updates: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl DittoFS {
-    pub fn new(store: Arc<ContextStore>) -> Self {
+    pub fn new(store: Arc<ContextStore>, local_updates: Option<tokio::sync::mpsc::Sender<Vec<u8>>>) -> Self {
         let mut inode_to_tree_id = HashMap::new();
         let mut tree_id_to_inode = HashMap::new();
         
@@ -34,6 +36,8 @@ impl DittoFS {
             inode_to_tree_id: RwLock::new(inode_to_tree_id),
             tree_id_to_inode: RwLock::new(tree_id_to_inode),
             next_inode: RwLock::new(2),
+            path_cache: RwLock::new(HashMap::new()),
+            local_updates,
         }
     }
 
@@ -56,15 +60,45 @@ impl DittoFS {
         inode
     }
 
+    fn sync_local_delta(&self, doc: &loro::LoroDoc, changed_blobs: Vec<String>) {
+        let last_vv = self.store.last_known_vv("root");
+        let update = doc.export(loro::ExportMode::updates(&last_vv)).unwrap();
+        
+        let mut blobs = std::collections::HashMap::new();
+        for blob_key in changed_blobs {
+            if let Some(data) = self.store.get_blob(&blob_key) {
+                blobs.insert(blob_key, data);
+            }
+        }
+
+        if !update.is_empty() || !blobs.is_empty() {
+            let ditto_update = crate::network::update::DittoUpdate {
+                loro_delta: update,
+                blobs,
+            };
+            if let Ok(encoded) = bincode::serialize(&ditto_update) {
+                if let Some(tx) = &self.local_updates {
+                    let _ = tx.try_send(encoded);
+                }
+            }
+            let _ = self.store.save_vv("root", &doc.oplog_vv());
+        }
+    }
+
     pub fn resolve_path(&self, path: &OsStr) -> Option<Option<TreeID>> {
-        let path_str = path.to_string_lossy();
+        let path_str = path.to_string_lossy().to_string();
         if path_str.is_empty() || path_str == "/" {
             return Some(None);
         }
         
+        if let Some(res) = self.path_cache.read().get(&path_str) {
+            return Some(res.clone());
+        }
+
         let components: Vec<&str> = path_str.trim_start_matches('/').split('/').collect();
         
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.read();
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -94,6 +128,7 @@ impl DittoFS {
             current_node = found;
         }
         
+        self.path_cache.write().insert(path_str, current_node.clone());
         Some(current_node)
     }
 }
@@ -114,7 +149,8 @@ impl PathFilesystem for DittoFS {
 
     async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<ReplyEntry> {
         let parent_id = self.resolve_path(parent).ok_or_else(|| Errno::from(libc::ENOENT))?;
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.read();
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -163,7 +199,8 @@ impl PathFilesystem for DittoFS {
     ) -> Result<ReplyEntry> {
         let parent_id = self.resolve_path(parent).ok_or_else(|| Errno::from(libc::ENOENT))?;
         
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.write();
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -198,7 +235,10 @@ impl PathFilesystem for DittoFS {
         {
             doc.commit();
             let _ = self.store.save_doc("root", &doc);
+            self.sync_local_delta(&doc, vec![]);
         }
+
+        self.path_cache.write().clear();
 
         Ok(ReplyEntry {
             ttl: std::time::Duration::from_secs(1),
@@ -229,7 +269,8 @@ impl PathFilesystem for DittoFS {
     ) -> Result<ReplyCreated> {
         let parent_id = self.resolve_path(parent).ok_or_else(|| Errno::from(libc::ENOENT))?;
         
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.write();
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -262,7 +303,10 @@ impl PathFilesystem for DittoFS {
         {
             doc.commit();
             let _ = self.store.save_doc("root", &doc);
+            self.sync_local_delta(&doc, vec![]);
         }
+
+        self.path_cache.write().clear();
 
         Ok(ReplyCreated {
             ttl: std::time::Duration::from_secs(1),
@@ -289,7 +333,8 @@ impl PathFilesystem for DittoFS {
     async fn open(&self, _req: Request, path: &OsStr, _flags: u32) -> Result<ReplyOpen> {
         let tree_id = self.resolve_path(path).flatten().ok_or_else(|| Errno::from(libc::ENOENT))?;
         
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.read();
         let metadata = doc.get_map("fs_metadata");
         let meta_map = match metadata.get(&tree_id.to_string()) {
             Some(ValueOrContainer::Container(Container::Map(m))) => m,
@@ -316,7 +361,8 @@ impl PathFilesystem for DittoFS {
         let path = path.ok_or_else(|| Errno::from(libc::EBADF))?;
         let tree_id = self.resolve_path(path).flatten().ok_or_else(|| Errno::from(libc::ENOENT))?;
 
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.read();
         let metadata = doc.get_map("fs_metadata");
         let meta_map = match metadata.get(&tree_id.to_string()) {
             Some(ValueOrContainer::Container(Container::Map(m))) => m,
@@ -329,14 +375,8 @@ impl PathFilesystem for DittoFS {
             }
         }
         
-        let text = if let Some(ValueOrContainer::Container(Container::Text(t))) = meta_map.get("content") {
-            t
-        } else {
-            meta_map.insert_container("content", loro::LoroText::new()).map_err(|_| Errno::from(libc::EIO))?
-        };
-        
-        let string_data = text.to_string();
-        let bytes = string_data.as_bytes();
+        let blob_key = format!("blob:{}", tree_id);
+        let bytes = self.store.get_blob(&blob_key).unwrap_or_default();
         
         let end = std::cmp::min((offset + size as u64) as usize, bytes.len());
         let start = std::cmp::min(offset as usize, bytes.len());
@@ -359,48 +399,35 @@ impl PathFilesystem for DittoFS {
         let path = path.ok_or_else(|| Errno::from(libc::EBADF))?;
         let tree_id = self.resolve_path(path).flatten().ok_or_else(|| Errno::from(libc::ENOENT))?;
 
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.write();
         let metadata = doc.get_map("fs_metadata");
         let meta_map = match metadata.get(&tree_id.to_string()) {
             Some(ValueOrContainer::Container(Container::Map(m))) => m,
             _ => return Err(libc::EIO.into()),
         };
         
-        let text = if let Some(ValueOrContainer::Container(Container::Text(t))) = meta_map.get("content") {
-            t
-        } else {
-            meta_map.insert_container("content", loro::LoroText::new()).map_err(|_| Errno::from(libc::EIO))?
-        };
-        
-        let current_string = text.to_string();
-        
-        // For simplicity, convert the incoming data to a valid string, replacing invalid UTF-8
-        let write_str = String::from_utf8_lossy(data);
-        println!("FUSE WRITE: {} bytes at offset {}", data.len(), offset);
-        
-        let len_chars = current_string.chars().count();
-        let offset_chars = current_string.split_at(std::cmp::min(offset as usize, current_string.len())).0.chars().count();
-        
-        // FUSE standard byte mapping to UTF-8 chars can be tricky.
-        // If it's a pure string override, we delete the required range and insert.
-        // A robust CRDT text editor would use precise indices, but for FUSE bridge, we fallback to char approximation:
-        if offset_chars < len_chars {
-            let delete_len = std::cmp::min(write_str.chars().count(), len_chars - offset_chars);
-            text.delete(offset_chars, delete_len).map_err(|_| Errno::from(libc::EIO))?;
+        let blob_key = format!("blob:{}", tree_id);
+        let mut buf = self.store.get_blob(&blob_key).unwrap_or_default();
+        let end = (offset as usize) + data.len();
+        if buf.len() < end {
+            buf.resize(end, 0);
         }
-        
-        text.insert(offset_chars, &write_str).map_err(|_| Errno::from(libc::EIO))?;
+        buf[offset as usize..end].copy_from_slice(data);
+        let len = buf.len();
+        self.store.set_blob(&blob_key, &buf).map_err(|_| Errno::from(libc::EIO))?;
         
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         meta_map.insert("mtime", now as i64).map_err(|_| Errno::from(libc::EIO))?;
         
-        // Update size logically (string bytes len)
-        meta_map.insert("size", text.to_string().len() as i64).map_err(|_| Errno::from(libc::EIO))?;
+        // Update size logically
+        meta_map.insert("size", len as i64).map_err(|_| Errno::from(libc::EIO))?;
 
         #[cfg(not(target_arch = "wasm32"))]
         {
             doc.commit();
             let _ = self.store.save_doc("root", &doc);
+            self.sync_local_delta(&doc, vec![blob_key]);
         }
 
         Ok(ReplyWrite {
@@ -419,7 +446,8 @@ impl PathFilesystem for DittoFS {
         let origin_parent_id = self.resolve_path(origin_parent).ok_or_else(|| Errno::from(libc::ENOENT))?;
         let target_parent_id = self.resolve_path(parent).ok_or_else(|| Errno::from(libc::ENOENT))?;
         
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.write();
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
         
@@ -462,14 +490,21 @@ impl PathFilesystem for DittoFS {
         }
         
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = self.store.save_doc("root", &doc);
+        {
+            doc.commit();
+            let _ = self.store.save_doc("root", &doc);
+            self.sync_local_delta(&doc, vec![]);
+        }
+
+        self.path_cache.write().clear();
 
         Ok(())
     }
 
     async fn unlink(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
         let parent_id = self.resolve_path(parent).ok_or_else(|| Errno::from(libc::ENOENT))?;
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.write();
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -485,7 +520,12 @@ impl PathFilesystem for DittoFS {
                             }
                             tree.delete(child_id).map_err(|_| Errno::from(libc::EIO))?;
                             #[cfg(not(target_arch = "wasm32"))]
-                            let _ = self.store.save_doc("root", &doc);
+                            {
+                                doc.commit();
+                                let _ = self.store.save_doc("root", &doc);
+                                self.sync_local_delta(&doc, vec![]);
+                            }
+                            self.path_cache.write().clear();
                             return Ok(());
                         }
                     }
@@ -497,7 +537,8 @@ impl PathFilesystem for DittoFS {
 
     async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
         let parent_id = self.resolve_path(parent).ok_or_else(|| Errno::from(libc::ENOENT))?;
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.write();
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -521,7 +562,12 @@ impl PathFilesystem for DittoFS {
 
                             tree.delete(child_id).map_err(|_| Errno::from(libc::EIO))?;
                             #[cfg(not(target_arch = "wasm32"))]
-                            let _ = self.store.save_doc("root", &doc);
+                            {
+                                doc.commit();
+                                let _ = self.store.save_doc("root", &doc);
+                                self.sync_local_delta(&doc, vec![]);
+                            }
+                            self.path_cache.write().clear();
                             return Ok(());
                         }
                     }
@@ -541,7 +587,8 @@ impl PathFilesystem for DittoFS {
         let path = path.ok_or_else(|| Errno::from(libc::EBADF))?;
         let node_id = self.resolve_path(path).ok_or_else(|| Errno::from(libc::ENOENT))?;
 
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.write();
         let metadata = doc.get_map("fs_metadata");
 
         let meta_map = if let Some(id) = node_id {
@@ -571,28 +618,16 @@ impl PathFilesystem for DittoFS {
             });
         };
 
+        let mut changed_blobs = vec![];
         // Handle truncation (most important: this is what echo uses before writing)
         if let Some(new_size) = set_attr.size {
-            // Get or create content LoroText
-            let text = if let Some(ValueOrContainer::Container(Container::Text(t))) = meta_map.get("content") {
-                t
-            } else {
-                meta_map.insert_container("content", loro::LoroText::new()).map_err(|_| Errno::from(libc::EIO))?
-            };
-
-            let current_len = text.to_string().chars().count();
-            let new_len = new_size as usize;
-
-            if new_len < current_len {
-                // Truncate
-                text.delete(new_len, current_len - new_len).map_err(|_| Errno::from(libc::EIO))?;
-            } else if new_len > current_len {
-                // Extend with null bytes (represented as spaces for UTF-8)
-                let padding = " ".repeat(new_len - current_len);
-                text.insert(current_len, &padding).map_err(|_| Errno::from(libc::EIO))?;
-            }
+            let blob_key = format!("blob:{}", node_id.unwrap());
+            let mut buf = self.store.get_blob(&blob_key).unwrap_or_default();
+            buf.resize(new_size as usize, 0);
+            self.store.set_blob(&blob_key, &buf).map_err(|_| Errno::from(libc::EIO))?;
             
             meta_map.insert("size", new_size as i64).map_err(|_| Errno::from(libc::EIO))?;
+            changed_blobs.push(blob_key);
         }
 
         if let Some(mode) = set_attr.mode {
@@ -607,6 +642,7 @@ impl PathFilesystem for DittoFS {
         {
             doc.commit();
             let _ = self.store.save_doc("root", &doc);
+            self.sync_local_delta(&doc, changed_blobs);
         }
 
         // Re-read the actual values for the reply
@@ -650,7 +686,8 @@ impl PathFilesystem for DittoFS {
         let path = path.unwrap_or_else(|| OsStr::new("/"));
         let node_id = self.resolve_path(path).ok_or_else(|| Errno::from(libc::ENOENT))?;
         
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.read();
         let metadata = doc.get_map("fs_metadata");
 
         let mut is_dir = true;
@@ -776,7 +813,8 @@ impl PathFilesystem for DittoFS {
 
         // Fetch dynamic children from Loro
         let parent_id = self.resolve_path(path).unwrap_or(None);
-        let doc = self.store.get_fs_root();
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.read();
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 

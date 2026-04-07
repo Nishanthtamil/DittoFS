@@ -1,14 +1,17 @@
 //! Context Store Module
 //! Handles the persistence layers using Sled DB and integrates with Loro.
 
-use loro::LoroDoc;
+use loro::{LoroDoc, VersionVector};
 #[cfg(not(target_arch = "wasm32"))]
 use sled::Db;
+use std::sync::Arc;
+use parking_lot::RwLock;
+use dashmap::DashMap;
 
 pub struct ContextStore {
     #[cfg(not(target_arch = "wasm32"))]
     db: Db,
-    docs: dashmap::DashMap<String, LoroDoc>,
+    docs: DashMap<String, Arc<RwLock<LoroDoc>>>,
 }
 
 impl ContextStore {
@@ -17,18 +20,18 @@ impl ContextStore {
         let db = sled::open(path)?;
         Ok(Self { 
             db,
-            docs: dashmap::DashMap::new(),
+            docs: DashMap::new(),
         })
     }
 
     #[cfg(target_arch = "wasm32")]
     pub fn new(_path: &str) -> Result<Self, String> {
         Ok(Self { 
-            docs: dashmap::DashMap::new(),
+            docs: DashMap::new(),
         })
     }
 
-    pub fn get_or_create_doc(&self, file_id: &str) -> LoroDoc {
+    pub fn get_or_create_doc(&self, file_id: &str) -> Arc<RwLock<LoroDoc>> {
         if let Some(doc) = self.docs.get(file_id) {
             return doc.clone();
         }
@@ -42,23 +45,27 @@ impl ContextStore {
             }
         }
 
-        self.docs.insert(file_id.to_string(), doc.clone());
-        doc
+        let arc = Arc::new(RwLock::new(doc));
+        self.docs.insert(file_id.to_string(), arc.clone());
+        arc
     }
     
-    pub fn get_fs_root(&self) -> LoroDoc {
-        let doc = self.get_or_create_doc("root");
-        // Ensure tree and metadata maps are initialized
-        let _tree = doc.get_tree("fs_tree");
-        let _metadata = doc.get_map("fs_metadata");
-        doc
+    pub fn get_fs_root(&self) -> Arc<RwLock<LoroDoc>> {
+        let doc_lock = self.get_or_create_doc("root");
+        {
+            let doc = doc_lock.write();
+            // Ensure tree and metadata maps are initialized
+            let _tree = doc.get_tree("fs_tree");
+            let _metadata = doc.get_map("fs_metadata");
+        }
+        doc_lock
     }
     
     pub fn get_all_keys(&self) -> Vec<String> {
         self.docs.iter().map(|kv| kv.key().clone()).collect()
     }
 
-    pub fn get_doc(&self, file_id: &str) -> Option<LoroDoc> {
+    pub fn get_doc(&self, file_id: &str) -> Option<Arc<RwLock<LoroDoc>>> {
         self.docs.get(file_id).map(|d| d.clone())
     }
     
@@ -73,6 +80,57 @@ impl ContextStore {
     #[cfg(target_arch = "wasm32")]
     pub fn save_doc(&self, _file_id: &str, _doc: &LoroDoc) -> Result<(), String> {
         // No persistence in WASM yet
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn get_blob(&self, key: &str) -> Option<Vec<u8>> {
+        self.db.get(key).ok().flatten().map(|v| v.to_vec())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_blob(&self, key: &str, data: &[u8]) -> Result<(), sled::Error> {
+        self.db.insert(key, data)?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn get_blob(&self, _key: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_blob(&self, _key: &str, _data: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn last_known_vv(&self, doc_id: &str) -> VersionVector {
+        let key = format!("vv:{}", doc_id);
+        if let Ok(Some(bytes)) = self.db.get(key) {
+            VersionVector::decode(&bytes).unwrap_or_default()
+        } else {
+            VersionVector::new()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_vv(&self, doc_id: &str, vv: &VersionVector) -> Result<(), sled::Error> {
+        let key = format!("vv:{}", doc_id);
+        let bytes = vv.encode();
+        self.db.insert(key, bytes)?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn last_known_vv(&self, _doc_id: &str) -> VersionVector {
+        VersionVector::new()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn save_vv(&self, _doc_id: &str, _vv: &VersionVector) -> Result<(), String> {
         Ok(())
     }
 }

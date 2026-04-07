@@ -10,6 +10,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use futures::stream::StreamExt;
 
+pub mod update;
+
 #[derive(NetworkBehaviour)]
 pub struct DittoNetworkBehaviour {
     pub gossipsub: gossipsub::Behaviour,
