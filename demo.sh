@@ -1,46 +1,54 @@
 #!/bin/bash
-# Terminal 1: Node A
-# Unmount and clean up
 fusermount -uz /tmp/ditto_a 2>/dev/null
 fusermount -uz /tmp/ditto_b 2>/dev/null
 rm -rf /tmp/ditto_a /tmp/ditto_b /tmp/db_a /tmp/db_b
 mkdir -p /tmp/ditto_a /tmp/ditto_b /tmp/db_a /tmp/db_b
 
 echo "Pre-building..."
-cargo build
+cargo build --release
 
 echo "Starting Node A..."
-cargo run -- --mount /tmp/ditto_a --db /tmp/db_a > node_a.log 2>&1 &
+./target/release/dittofs --mount /tmp/ditto_a --db /tmp/db_a > node_a.log 2>&1 &
 PID_A=$!
 sleep 5
 
 echo "Starting Node B..."
-cargo run -- --mount /tmp/ditto_b --db /tmp/db_b > node_b.log 2>&1 &
+./target/release/dittofs --mount /tmp/ditto_b --db /tmp/db_b > node_b.log 2>&1 &
 PID_B=$!
-sleep 15 # Wait for MDNS discovery
 
-# The demo
-echo "Writing 'hello from node A' to /tmp/ditto_a/test.txt"
+echo "Waiting 30s for mDNS discovery and gossipsub peer connection..."
+sleep 30
+
+echo "Writing test file on Node A..."
 echo "hello from node A" > /tmp/ditto_a/test.txt
-sleep 10
 
-echo "Checking /tmp/ditto_a for files:"
-ls -R /tmp/ditto_a
+echo "Polling Node B for sync (up to 60s)..."
+RESULT=""
+for i in $(seq 1 30); do
+    RESULT=$(cat /tmp/ditto_b/test.txt 2>/dev/null)
+    if [ "$RESULT" = "hello from node A" ]; then
+        echo "Synced after $((i * 2)) seconds"
+        break
+    fi
+    sleep 2
+done
 
-echo "Reading from Node B /tmp/ditto_b/test.txt:"
-ls -R /tmp/ditto_b
-RESULT=$(cat /tmp/ditto_b/test.txt 2>/dev/null)
-echo "Result: $RESULT"
+echo "Node A files: $(ls /tmp/ditto_a)"
+echo "Node B files: $(ls /tmp/ditto_b)"
 
-# Cleanup
-kill $PID_A $PID_B
+kill $PID_A $PID_B 2>/dev/null
 wait $PID_A $PID_B 2>/dev/null
 fusermount -uz /tmp/ditto_a 2>/dev/null
 fusermount -uz /tmp/ditto_b 2>/dev/null
 
-if [ "$RESULT" == "hello from node A" ]; then
+if [ "$RESULT" = "hello from node A" ]; then
     echo "SUCCESS: Sync worked!"
+    exit 0
 else
-    echo "FAILURE: Sync failed or timed out."
-    echo "Check node_a.log and node_b.log for details."
+    echo "FAILURE: Sync did not complete within 60 seconds."
+    echo "--- Node A log ---"
+    cat node_a.log
+    echo "--- Node B log ---"
+    cat node_b.log
+    exit 1
 fi

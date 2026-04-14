@@ -37,7 +37,7 @@ impl ContextStore {
         }
 
         let doc = LoroDoc::new();
-        
+
         #[cfg(not(target_arch = "wasm32"))]
         {
             if let Ok(Some(snapshot)) = self.db.get(file_id) {
@@ -45,20 +45,20 @@ impl ContextStore {
             }
         }
 
+        // Initialize containers exactly once, here, not on every get_fs_root call
+        if file_id == "root" {
+            let _tree = doc.get_tree("fs_tree");
+            let _metadata = doc.get_map("fs_metadata");
+        }
+
         let arc = Arc::new(RwLock::new(doc));
         self.docs.insert(file_id.to_string(), arc.clone());
         arc
     }
-    
+
+    // get_fs_root is now a zero-cost passthrough — NO locking here
     pub fn get_fs_root(&self) -> Arc<RwLock<LoroDoc>> {
-        let doc_lock = self.get_or_create_doc("root");
-        {
-            let doc = doc_lock.write();
-            // Ensure tree and metadata maps are initialized
-            let _tree = doc.get_tree("fs_tree");
-            let _metadata = doc.get_map("fs_metadata");
-        }
-        doc_lock
+        self.get_or_create_doc("root")
     }
     
     pub fn get_all_keys(&self) -> Vec<String> {
@@ -109,16 +109,16 @@ impl ContextStore {
     pub fn last_known_vv(&self, doc_id: &str) -> VersionVector {
         let key = format!("vv:{}", doc_id);
         if let Ok(Some(bytes)) = self.db.get(key) {
-            VersionVector::decode(&bytes).unwrap_or_default()
+            bincode::deserialize(&bytes).unwrap_or_default()
         } else {
-            VersionVector::new()
+            VersionVector::default()
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn save_vv(&self, doc_id: &str, vv: &VersionVector) -> Result<(), sled::Error> {
         let key = format!("vv:{}", doc_id);
-        let bytes = vv.encode();
+        let bytes = bincode::serialize(vv).unwrap_or_default();
         self.db.insert(key, bytes)?;
         self.db.flush()?;
         Ok(())
