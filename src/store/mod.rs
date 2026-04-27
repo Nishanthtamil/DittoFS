@@ -32,28 +32,24 @@ impl ContextStore {
     }
 
     pub fn get_or_create_doc(&self, file_id: &str) -> Arc<RwLock<LoroDoc>> {
-        if let Some(doc) = self.docs.get(file_id) {
-            return doc.clone();
-        }
+        self.docs.entry(file_id.to_string()).or_insert_with(|| {
+            let doc = LoroDoc::new();
 
-        let doc = LoroDoc::new();
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Ok(Some(snapshot)) = self.db.get(file_id) {
-                let _ = doc.import(&snapshot);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if let Ok(Some(snapshot)) = self.db.get(file_id) {
+                    let _ = doc.import(&snapshot);
+                }
             }
-        }
 
-        // Initialize containers exactly once, here, not on every get_fs_root call
-        if file_id == "root" {
-            let _tree = doc.get_tree("fs_tree");
-            let _metadata = doc.get_map("fs_metadata");
-        }
+            // Initialize containers exactly once, here, not on every get_fs_root call
+            if file_id == "root" {
+                let _tree = doc.get_tree("fs_tree");
+                let _metadata = doc.get_map("fs_metadata");
+            }
 
-        let arc = Arc::new(RwLock::new(doc));
-        self.docs.insert(file_id.to_string(), arc.clone());
-        arc
+            Arc::new(RwLock::new(doc))
+        }).clone()
     }
 
     // get_fs_root is now a zero-cost passthrough — NO locking here

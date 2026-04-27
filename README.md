@@ -48,18 +48,19 @@ chmod +x demo.sh && ./demo.sh
 ## Test Output
 
 ```
-$ cargo test -- --nocapture
+$ cargo test
 
-running 0 tests
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-
+     Running tests/git_test.rs
 running 1 test
 test git_init_succeeds_on_mount ... ok
+
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
+     Running tests/sync_test.rs
 running 3 tests
 test concurrent_conflict_resolves_cleanly ... ok
 test truncate_then_write_produces_correct_content ... ok
 test two_nodes_sync_via_wire_format ... ok
+
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
