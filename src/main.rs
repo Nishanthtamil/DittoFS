@@ -27,6 +27,9 @@ struct Args {
 
     #[arg(short, long, default_value = "/tmp/dittofs-sled")]
     db: String,
+
+    #[arg(short, long)]
+    bootstrap: Vec<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,6 +39,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("DittoFS starting up...");
     println!("Mount point: {}", args.mount);
     println!("Database: {}", args.db);
+
+    let bootstrap_nodes = args.bootstrap.iter().filter_map(|s| {
+        let parts: Vec<&str> = s.split("/p2p/").collect();
+        if parts.len() != 2 { return None; }
+        let addr: libp2p::Multiaddr = parts[0].parse().ok()?;
+        let peer_id: libp2p::PeerId = parts[1].parse().ok()?;
+        Some((peer_id, addr))
+    }).collect();
 
     let store = Arc::new(store::ContextStore::new(&args.db)?);
     
@@ -47,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx_remote, mut rx_remote) = mpsc::channel(100);
     
     let swarm = network::create_swarm()?;
-    tokio::spawn(network::run_swarm(swarm, rx_local, tx_remote));
+    tokio::spawn(network::run_swarm(swarm, rx_local, tx_remote, bootstrap_nodes, store.clone()));
 
     // Swarm delta-broadcast updates intake
     let store_clone = store.clone();

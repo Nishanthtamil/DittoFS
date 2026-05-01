@@ -129,4 +129,30 @@ impl ContextStore {
     pub fn save_vv(&self, _doc_id: &str, _vv: &VersionVector) -> Result<(), String> {
         Ok(())
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_peer(&self, peer_id: &libp2p::PeerId, addr: &libp2p::Multiaddr) -> Result<(), sled::Error> {
+        let key = format!("peer:{}", peer_id.to_base58());
+        self.db.insert(key, addr.to_vec())?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn get_known_peers(&self) -> Vec<(libp2p::PeerId, libp2p::Multiaddr)> {
+        let mut peers = Vec::new();
+        for res in self.db.scan_prefix("peer:") {
+            if let Ok((key, value)) = res {
+                let key_str = String::from_utf8_lossy(&key);
+                if let Some(peer_id_str) = key_str.strip_prefix("peer:") {
+                    if let Ok(peer_id) = peer_id_str.parse::<libp2p::PeerId>() {
+                        if let Ok(addr) = libp2p::Multiaddr::try_from(value.to_vec()) {
+                            peers.push((peer_id, addr));
+                        }
+                    }
+                }
+            }
+        }
+        peers
+    }
 }

@@ -12,7 +12,7 @@ use futures::stream::{self, StreamExt, BoxStream};
 
 use std::collections::HashMap;
 use parking_lot::RwLock;
-use loro::{TreeID, Container, ValueOrContainer};
+use loro::{TreeID, Container, ValueOrContainer, PeerID};
 
 pub struct DittoFS {
     pub store: Arc<ContextStore>,
@@ -20,6 +20,7 @@ pub struct DittoFS {
     pub tree_id_to_inode: RwLock<HashMap<Option<TreeID>, u64>>,
     pub next_inode: RwLock<u64>,
     pub path_cache: RwLock<HashMap<String, Option<TreeID>>>,
+    pub size_cache: RwLock<HashMap<TreeID, u64>>,
     pub local_updates: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 }
 
@@ -37,6 +38,7 @@ impl DittoFS {
             tree_id_to_inode: RwLock::new(tree_id_to_inode),
             next_inode: RwLock::new(2),
             path_cache: RwLock::new(HashMap::new()),
+            size_cache: RwLock::new(HashMap::new()),
             local_updates,
         }
     }
@@ -114,7 +116,14 @@ impl DittoFS {
                 if let Some(child_meta_val) = metadata.get(&child_id.to_string()) {
                     if let ValueOrContainer::Container(Container::Map(m)) = child_meta_val {
                         if let Some(ValueOrContainer::Value(loro::LoroValue::String(name))) = m.get("name") {
-                            if name.as_ref() == part {
+                            let name_str = name.as_ref();
+                            if name_str == part {
+                                found = Some(child_id);
+                                break;
+                            }
+                            // Check for mangled name: "name (peer_id)"
+                            let mangled = format!("{} ({})", name_str, &child_id.peer.to_string()[..4]);
+                            if mangled == part {
                                 found = Some(child_id);
                                 break;
                             }
@@ -256,6 +265,15 @@ impl PathFilesystem for DittoFS {
         let map = metadata.insert_container(&new_id.to_string(), loro::LoroMap::new()).map_err(|_| Errno::from(libc::EIO))?;
         map.insert("name", name.to_string_lossy().to_string()).map_err(|_| Errno::from(libc::EIO))?;
         map.insert("type", "directory").map_err(|_| Errno::from(libc::EIO))?;
+        map.insert("nlink", 2i64).map_err(|_| Errno::from(libc::EIO))?;
+
+        // Increment parent nlink
+        if let Some(id) = parent_id {
+            if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&id.to_string()) {
+                let current: i64 = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("nlink") { v } else { 2 };
+                m.insert("nlink", current + 1).map_err(|_| Errno::from(libc::EIO))?;
+            }
+        }
 
         // Ensure u32 maps properly into Loro (since it natively prefers i32/f64 for numbers, cast to i32)
         map.insert("mode", mode as i32).map_err(|_| Errno::from(libc::EIO))?;
@@ -326,6 +344,7 @@ impl PathFilesystem for DittoFS {
         let map = metadata.insert_container(&new_id.to_string(), loro::LoroMap::new()).map_err(|_| Errno::from(libc::EIO))?;
         map.insert("name", name.to_string_lossy().to_string()).map_err(|_| Errno::from(libc::EIO))?;
         map.insert("type", "file").map_err(|_| Errno::from(libc::EIO))?;
+        map.insert("nlink", 1i64).map_err(|_| Errno::from(libc::EIO))?;
         map.insert("mode", mode as i32).map_err(|_| Errno::from(libc::EIO))?;
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -451,6 +470,7 @@ impl PathFilesystem for DittoFS {
         buf[offset as usize..end].copy_from_slice(data);
         let len = buf.len();
         self.store.set_blob(&blob_key, &buf).map_err(|_| Errno::from(libc::EIO))?;
+        self.size_cache.write().insert(tree_id, len as u64);
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         meta_map.insert("mtime", now as i64).map_err(|_| Errno::from(libc::EIO))?;
@@ -502,12 +522,22 @@ impl PathFilesystem for DittoFS {
 
         let node_to_move = target_node.ok_or_else(|| Errno::from(libc::ENOENT))?;
 
+        // Check if target already exists
         if let Some(children) = tree.children(target_parent_id) {
             for child_id in children {
                 if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&child_id.to_string()) {
                     if let Some(ValueOrContainer::Value(loro::LoroValue::String(n))) = m.get("name") {
                         if n.as_ref() == name.to_string_lossy() {
-                            // Clean up file if overriding
+                            // POSIX: If target is a directory, it must be empty.
+                            if let Some(ValueOrContainer::Value(loro::LoroValue::String(t))) = m.get("type") {
+                                if t.as_ref() == "directory" {
+                                    if let Some(sub) = tree.children(Some(child_id)) {
+                                        if !sub.is_empty() {
+                                            return Err(libc::ENOTEMPTY.into());
+                                        }
+                                    }
+                                }
+                            }
                             tree.delete(child_id).map_err(|_| Errno::from(libc::EIO))?;
                             break;
                         }
@@ -518,10 +548,10 @@ impl PathFilesystem for DittoFS {
 
         tree.mov(node_to_move, target_parent_id).map_err(|_| Errno::from(libc::EIO))?;
 
-        if origin_name != name {
-            if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&node_to_move.to_string()) {
-                m.insert("name", name.to_string_lossy().to_string()).map_err(|_| Errno::from(libc::EIO))?;
-            }
+        if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&node_to_move.to_string()) {
+            m.insert("name", name.to_string_lossy().to_string()).map_err(|_| Errno::from(libc::EIO))?;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            m.insert("mtime", now as i64).map_err(|_| Errno::from(libc::EIO))?;
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -596,6 +626,15 @@ impl PathFilesystem for DittoFS {
                             }
 
                             tree.delete(child_id).map_err(|_| Errno::from(libc::EIO))?;
+
+                            // Decrement parent nlink
+                            if let Some(pid) = parent_id {
+                                if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&pid.to_string()) {
+                                    let current: i64 = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("nlink") { v } else { 2 };
+                                    m.insert("nlink", (current - 1).max(2)).map_err(|_| Errno::from(libc::EIO))?;
+                                }
+                            }
+
                             #[cfg(not(target_arch = "wasm32"))]
                             {
                                 doc.commit();
@@ -660,6 +699,7 @@ impl PathFilesystem for DittoFS {
             let mut buf = self.store.get_blob(&blob_key).unwrap_or_default();
             buf.resize(new_size as usize, 0);
             self.store.set_blob(&blob_key, &buf).map_err(|_| Errno::from(libc::EIO))?;
+            self.size_cache.write().insert(node_id.unwrap(), new_size);
 
             meta_map.insert("size", new_size as i64).map_err(|_| Errno::from(libc::EIO))?;
             changed_blobs.push(blob_key);
@@ -757,18 +797,51 @@ impl PathFilesystem for DittoFS {
 
                 mode = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("mode") { v as u16 } else { 0o755 };
 
+                let nlink_val = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("nlink") {
+                    v as u32
+                } else {
+                    if is_dir { 2 } else { 1 }
+                };
+
                 // For files, always measure the actual blob size — never trust metadata
                 size = if is_dir {
                     4096
                 } else {
-                    let blob_key = format!("blob:{}", id);
-                    self.store.get_blob(&blob_key)
-                        .map(|b| b.len() as u64)
-                        .unwrap_or(0)
+                    if let Some(&s) = self.size_cache.read().get(&id) {
+                        s
+                    } else {
+                        let blob_key = format!("blob:{}", id);
+                        let s = self.store.get_blob(&blob_key)
+                            .map(|b| b.len() as u64)
+                            .unwrap_or(0);
+                        self.size_cache.write().insert(id, s);
+                        s
+                    }
                 };
 
                 ctime = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(c))) = m.get("ctime") { c as u64 } else { ctime };
                 mtime = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(mt))) = m.get("mtime") { mt as u64 } else { mtime };
+
+                let ctime_dur = UNIX_EPOCH + std::time::Duration::from_secs(ctime);
+                let mtime_dur = UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+
+                return Ok(ReplyAttr {
+                    attr: FileAttr {
+                        size,
+                        blocks: 0,
+                        atime: mtime_dur,
+                        mtime: mtime_dur,
+                        ctime: ctime_dur,
+                        kind,
+                        perm: mode & 0o777,
+                        nlink: nlink_val,
+                        uid: 1000,
+                        gid: 1000,
+                        rdev: 0,
+                        blksize: 4096,
+                    },
+                    ttl: std::time::Duration::from_secs(1),
+                });
             } else {
                 return Err(libc::ENOENT.into());
             }
@@ -785,7 +858,7 @@ impl PathFilesystem for DittoFS {
             ctime: ctime_dur,
             kind,
             perm: mode & 0o777,
-            nlink: if is_dir { 2 } else { 1 },
+            nlink: 2,
             uid: 1000,
             gid: 1000,
             rdev: 0,
@@ -831,29 +904,41 @@ impl PathFilesystem for DittoFS {
 
         if let Some(children) = tree.children(parent_id) {
             let mut current_offset: i64 = 3;
+            
+            // Collect all names to detect conflicts
+            let mut name_counts = std::collections::HashMap::new();
+            let mut child_info = Vec::new();
+            
             for child_id in children {
+                if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&child_id.to_string()) {
+                    if let Some(ValueOrContainer::Value(loro::LoroValue::String(n))) = m.get("name") {
+                        let name_str = n.as_ref().to_string();
+                        *name_counts.entry(name_str.clone()).or_insert(0) += 1;
+                        child_info.push((child_id, name_str));
+                    }
+                }
+            }
+
+            for (child_id, name) in child_info {
                 if current_offset > offset {
-                    if let Some(ValueOrContainer::Container(Container::Map(m))) =
-                        metadata.get(&child_id.to_string())
-                    {
-                        if let Some(ValueOrContainer::Value(loro::LoroValue::String(n))) =
-                            m.get("name")
-                        {
-                            let type_str = if let Some(ValueOrContainer::Value(
-                                loro::LoroValue::String(t),
-                            )) = m.get("type")
-                            {
-                                t.as_ref().to_string()
-                            } else {
-                                "file".to_string()
-                            };
-                            let kind = Self::file_type_from_str(&type_str);
-                            entries.push(Ok(DirectoryEntry {
-                                kind,
-                                name: n.as_ref().into(),
-                                offset: current_offset,
-                            }));
-                        }
+                    let final_name = if *name_counts.get(&name).unwrap_or(&1) > 1 {
+                        format!("{} ({})", name, &child_id.peer.to_string()[..4])
+                    } else {
+                        name
+                    };
+
+                    if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&child_id.to_string()) {
+                        let type_str = if let Some(ValueOrContainer::Value(loro::LoroValue::String(t))) = m.get("type") {
+                            t.as_ref().to_string()
+                        } else {
+                            "file".to_string()
+                        };
+                        let kind = Self::file_type_from_str(&type_str);
+                        entries.push(Ok(DirectoryEntry {
+                            kind,
+                            name: final_name.into(),
+                            offset: current_offset,
+                        }));
                     }
                 }
                 current_offset += 1;
@@ -919,57 +1004,76 @@ impl PathFilesystem for DittoFS {
 
         if let Some(children) = tree.children(parent_id) {
             let mut current_offset = 3;
+
+            // Collect all names to detect conflicts
+            let mut name_counts = std::collections::HashMap::new();
+            let mut child_info = Vec::new();
+
             for child_id in children {
+                if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&child_id.to_string()) {
+                    if let Some(ValueOrContainer::Value(loro::LoroValue::String(n))) = m.get("name") {
+                        let name_str = n.as_ref().to_string();
+                        *name_counts.entry(name_str.clone()).or_insert(0) += 1;
+                        child_info.push((child_id, name_str));
+                    }
+                }
+            }
+
+            for (child_id, name) in child_info {
                 if current_offset > offset {
+                    let final_name = if *name_counts.get(&name).unwrap_or(&1) > 1 {
+                        format!("{} ({})", name, &child_id.peer.to_string()[..4])
+                    } else {
+                        name
+                    };
+
                     if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&child_id.to_string()) {
-                        if let Some(ValueOrContainer::Value(loro::LoroValue::String(n))) = m.get("name") {
-                            let type_str = if let Some(ValueOrContainer::Value(loro::LoroValue::String(t))) = m.get("type") {
-                                t.as_ref().to_string()
-                            } else {
-                                "file".to_string()
-                            };
-                            let is_dir = type_str == "directory";
-                            let kind = Self::file_type_from_str(&type_str);
-                            let mode = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("mode") { v as u16 } else { 0o755 };
+                        let type_str = if let Some(ValueOrContainer::Value(loro::LoroValue::String(t))) = m.get("type") {
+                            t.as_ref().to_string()
+                        } else {
+                            "file".to_string()
+                        };
+                        let is_dir = type_str == "directory";
+                        let kind = Self::file_type_from_str(&type_str);
+                        let mode = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("mode") { v as u16 } else { 0o755 };
 
-                            // For files, always measure actual blob size
-                            let size = if is_dir {
-                                4096
-                            } else {
-                                let blob_key = format!("blob:{}", child_id);
-                                self.store.get_blob(&blob_key)
-                                    .map(|b| b.len() as u64)
-                                    .unwrap_or(0)
-                            };
+                        // For files, always measure actual blob size
+                        let size = if is_dir {
+                            4096
+                        } else {
+                            let blob_key = format!("blob:{}", child_id);
+                            self.store.get_blob(&blob_key)
+                                .map(|b| b.len() as u64)
+                                .unwrap_or(0)
+                        };
 
-                            let ct = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(c))) = m.get("ctime") { c as u64 } else { now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() };
-                            let mt = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(m))) = m.get("mtime") { m as u64 } else { now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() };
+                        let ct = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(c))) = m.get("ctime") { c as u64 } else { now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() };
+                        let mt = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(m))) = m.get("mtime") { m as u64 } else { now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() };
 
-                            let itime = UNIX_EPOCH + std::time::Duration::from_secs(ct);
-                            let ytime = UNIX_EPOCH + std::time::Duration::from_secs(mt);
+                        let itime = UNIX_EPOCH + std::time::Duration::from_secs(ct);
+                        let ytime = UNIX_EPOCH + std::time::Duration::from_secs(mt);
 
-                            entries.push(Ok(DirectoryEntryPlus {
+                        entries.push(Ok(DirectoryEntryPlus {
+                            kind,
+                            name: final_name.into(),
+                            offset: current_offset as i64,
+                            attr: FileAttr {
+                                size,
+                                blocks: 0,
+                                atime: ytime,
+                                mtime: ytime,
+                                ctime: itime,
                                 kind,
-                                name: n.as_ref().into(),
-                                offset: current_offset as i64,
-                                attr: FileAttr {
-                                    size,
-                                    blocks: 0,
-                                    atime: ytime,
-                                    mtime: ytime,
-                                    ctime: itime,
-                                    kind,
-                                    perm: mode & 0o777,
-                                    nlink: if is_dir { 2 } else { 1 },
-                                    uid: 1000,
-                                    gid: 1000,
-                                    rdev: 0,
-                                    blksize: 4096,
-                                },
-                                entry_ttl: std::time::Duration::from_secs(1),
-                                attr_ttl: std::time::Duration::from_secs(1),
-                            }));
-                        }
+                                perm: mode & 0o777,
+                                nlink: if is_dir { 2 } else { 1 },
+                                uid: 1000,
+                                gid: 1000,
+                                rdev: 0,
+                                blksize: 4096,
+                            },
+                            entry_ttl: std::time::Duration::from_secs(1),
+                            attr_ttl: std::time::Duration::from_secs(1),
+                        }));
                     }
                 }
                 current_offset += 1;
@@ -1051,6 +1155,8 @@ impl PathFilesystem for DittoFS {
         map.insert("name", name.to_string_lossy().to_string())
             .map_err(|_| Errno::from(libc::EIO))?;
         map.insert("type", "symlink")
+            .map_err(|_| Errno::from(libc::EIO))?;
+        map.insert("nlink", 1i64)
             .map_err(|_| Errno::from(libc::EIO))?;
         map.insert("mode", 0o777i32)
             .map_err(|_| Errno::from(libc::EIO))?;

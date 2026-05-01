@@ -20,12 +20,21 @@ bincode = "1.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fuse3 = { version = "0.8.1", features = ["tokio-runtime", "unprivileged"] }
-libp2p = { version = "0.54", features = ["tokio", "quic", "macros", "gossipsub", "mdns", "noise", "tcp", "tls", "yamux"] }
+libp2p = { version = "0.54", features = ["tokio", "quic", "macros", "gossipsub", "mdns", "noise", "tcp", "tls", "yamux", "kad", "identify"] }
 sled = "0.34"
 tokio-uring = "0.5"
+
+[[bin]]
+name = "dittofs-bootstrap"
+path = "bootstrap/main.rs"
+
+[[bin]]
+name = "dittofs"
+path = "src/main.rs"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1.7"
 js-sys = "0.3"
+serde-wasm-bindgen = "0.6"

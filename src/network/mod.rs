@@ -2,7 +2,7 @@
 //! Handles peer-to-peer communication using libp2p.
 
 use libp2p::{
-    gossipsub, mdns, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, tls, yamux, Swarm
+    gossipsub, mdns, kad, identify, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, tls, yamux, Swarm, PeerId, Multiaddr, StreamProtocol
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -16,9 +16,12 @@ pub mod update;
 pub struct DittoNetworkBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
+    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    pub identify: identify::Behaviour,
 }
 
 pub const DITTO_TOPIC: &str = "ditto-fs-sync";
+pub const DITTO_PROTOCOL: &str = "/dittofs/1.0.0";
 
 pub fn create_swarm() -> Result<Swarm<DittoNetworkBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
     let swarm = libp2p::SwarmBuilder::with_new_identity()
@@ -49,7 +52,17 @@ pub fn create_swarm() -> Result<Swarm<DittoNetworkBehaviour>, Box<dyn std::error
             ).expect("Valid gossipsub behaviour");
             
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
-            Ok(DittoNetworkBehaviour { gossipsub, mdns })
+            
+            let kad_config = kad::Config::new(StreamProtocol::new(DITTO_PROTOCOL));
+            let store = kad::store::MemoryStore::new(key.public().to_peer_id());
+            let kademlia = kad::Behaviour::with_config(key.public().to_peer_id(), store, kad_config);
+
+            let identify = identify::Behaviour::new(identify::Config::new(
+                DITTO_PROTOCOL.into(),
+                key.public(),
+            ));
+
+            Ok(DittoNetworkBehaviour { gossipsub, mdns, kademlia, identify })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
@@ -60,10 +73,23 @@ pub fn create_swarm() -> Result<Swarm<DittoNetworkBehaviour>, Box<dyn std::error
 pub async fn run_swarm(
     mut swarm: Swarm<DittoNetworkBehaviour>,
     mut local_updates: mpsc::Receiver<Vec<u8>>,
-    remote_updates: mpsc::Sender<Vec<u8>>
+    remote_updates: mpsc::Sender<Vec<u8>>,
+    bootstrap_nodes: Vec<(PeerId, Multiaddr)>,
+    store: std::sync::Arc<crate::store::ContextStore>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+
+    for (peer_id, addr) in bootstrap_nodes {
+        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+    }
+    
+    // Load known peers from store
+    for (peer_id, addr) in store.get_known_peers() {
+        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+    }
+    
+    let _ = swarm.behaviour_mut().kademlia.bootstrap();
 
     let topic = gossipsub::IdentTopic::new(DITTO_TOPIC);
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
@@ -81,8 +107,10 @@ pub async fn run_swarm(
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(DittoNetworkBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    for (peer_id, _multiaddr) in list {
+                    for (peer_id, addr) in list {
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                        let _ = store.save_peer(&peer_id, &addr);
                     }
                 }
                 SwarmEvent::Behaviour(DittoNetworkBehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -91,6 +119,15 @@ pub async fn run_swarm(
                     message,
                 })) => {
                     let _ = remote_updates.send(message.data).await;
+                }
+                SwarmEvent::Behaviour(DittoNetworkBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                    for addr in info.listen_addrs {
+                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                        let _ = store.save_peer(&peer_id, &addr);
+                    }
+                }
+                SwarmEvent::Behaviour(DittoNetworkBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { peer, .. })) => {
+                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
                 }
                 _ => {}
             }
