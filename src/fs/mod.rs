@@ -12,7 +12,7 @@ use futures::stream::{self, StreamExt, BoxStream};
 
 use std::collections::HashMap;
 use parking_lot::RwLock;
-use loro::{TreeID, Container, ValueOrContainer, PeerID};
+use loro::{TreeID, Container, ValueOrContainer};
 
 pub struct DittoFS {
     pub store: Arc<ContextStore>,
@@ -62,20 +62,78 @@ impl DittoFS {
         inode
     }
 
+    fn get_file_size(&self, meta_map: &loro::LoroMap, tree_id: &TreeID) -> u64 {
+        if let Some(&s) = self.size_cache.read().get(tree_id) {
+            return s;
+        }
+
+        let s = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = meta_map.get("size") {
+            v as u64
+        } else if let Some(ValueOrContainer::Container(Container::List(l))) = meta_map.get("chunks") {
+            let hashes: Vec<String> = (0..l.len())
+                .filter_map(|i| {
+                    match l.get(i) {
+                        Some(ValueOrContainer::Value(loro::LoroValue::String(s))) => Some(s.as_ref().to_string()),
+                        _ => None
+                    }
+                })
+                .collect();
+            self.store.get_blob_chunks(&hashes).map(|b| b.len() as u64).unwrap_or(0)
+        } else if let Some(ValueOrContainer::Value(loro::LoroValue::String(hash))) = meta_map.get("blob_hash") {
+            self.store.get_blob_cas(hash.as_ref()).map(|b| b.len() as u64).unwrap_or(0)
+        } else {
+            let blob_key = format!("blob:{}", tree_id);
+            self.store.get_blob(&blob_key).map(|b| b.len() as u64).unwrap_or(0)
+        };
+
+        self.size_cache.write().insert(*tree_id, s);
+        s
+    }
+
+    pub fn get_file_bytes(&self, meta_map: &loro::LoroMap, tree_id: &TreeID) -> Vec<u8> {
+        if let Some(ValueOrContainer::Container(Container::List(l))) = meta_map.get("chunks") {
+            let hashes: Vec<String> = (0..l.len())
+                .filter_map(|i| {
+                    match l.get(i) {
+                        Some(ValueOrContainer::Value(loro::LoroValue::String(s))) => Some(s.as_ref().to_string()),
+                        _ => None
+                    }
+                })
+                .collect();
+            self.store.get_blob_chunks(&hashes).unwrap_or_default()
+        } else if let Some(ValueOrContainer::Value(loro::LoroValue::String(hash))) = meta_map.get("blob_hash") {
+            self.store.get_blob_cas(hash.as_ref()).unwrap_or_default()
+        } else {
+            let blob_key = format!("blob:{}", tree_id);
+            self.store.get_blob(&blob_key).unwrap_or_default()
+        }
+    }
+
     fn sync_local_delta(&self, doc: &loro::LoroDoc, changed_blobs: Vec<String>) {
         let last_vv = self.store.last_known_vv("root");
         let update = doc.export(loro::ExportMode::updates(&last_vv)).unwrap();
 
         let mut blobs = std::collections::HashMap::new();
         for blob_key in changed_blobs {
-            if let Some(data) = self.store.get_blob(&blob_key) {
+            let data = if let Some(hash) = blob_key.strip_prefix("cas:") {
+                self.store.get_blob_cas(hash)
+            } else {
+                self.store.get_blob(&blob_key)
+            };
+            if let Some(data) = data {
                 blobs.insert(blob_key, data);
             }
         }
 
         if !update.is_empty() || !blobs.is_empty() {
+            let loro_delta = if let Some(key) = &self.store.space_key {
+                key.encrypt_metadata(&update)
+            } else {
+                update
+            };
+
             let ditto_update = crate::network::update::DittoUpdate {
-                loro_delta: update,
+                loro_delta,
                 blobs,
             };
             if let Ok(encoded) = bincode::serialize(&ditto_update) {
@@ -87,20 +145,76 @@ impl DittoFS {
         }
     }
 
-    pub fn resolve_path(&self, path: &OsStr) -> Option<Option<TreeID>> {
-        let path_str = path.to_string_lossy().to_string();
-        if path_str.is_empty() || path_str == "/" {
+    pub fn check_write_permission(&self, doc: &loro::LoroDoc, tree_id: Option<TreeID>) -> Result<()> {
+        let id = match tree_id {
+            Some(i) => i,
+            None => return Ok(()), // Root is writable by all for now
+        };
+        let permissions = doc.get_map("permissions");
+        if let Some(ValueOrContainer::Container(Container::Map(m))) = permissions.get(&id.to_string()) {
+            #[cfg(not(target_arch = "wasm32"))]
+            let local_peer_id = self.store.local_peer_id.to_string();
+            #[cfg(target_arch = "wasm32")]
+            let local_peer_id = "".to_string();
+            
+            // Check owner
+            if let Some(ValueOrContainer::Value(loro::LoroValue::String(owner))) = m.get("owner_peer") {
+                if owner.as_ref() == local_peer_id.as_str() {
+                    return Ok(());
+                }
+            }
+
+            // Check ACL
+            if let Some(ValueOrContainer::Container(Container::Map(acl))) = m.get("acl") {
+                // Check specific peer
+                if let Some(ValueOrContainer::Value(loro::LoroValue::String(perm))) = acl.get(&local_peer_id) {
+                    if perm.as_ref().contains('w') {
+                        return Ok(());
+                    }
+                }
+                
+                // Check wildcard
+                if let Some(ValueOrContainer::Value(loro::LoroValue::String(perm))) = acl.get("*") {
+                    if perm.as_ref().contains('w') {
+                        return Ok(());
+                    }
+                }
+            }
+            
+            return Err(Errno::from(libc::EACCES));
+        }
+        
+        // If no permissions are set, default to allow for backward compatibility/simplicity
+        Ok(())
+    }
+
+    pub fn set_initial_permissions(&self, doc: &loro::LoroDoc, tree_id: TreeID) -> Result<()> {
+        let permissions = doc.get_map("permissions");
+        let map = permissions.insert_container(&tree_id.to_string(), loro::LoroMap::new()).map_err(|_| Errno::from(libc::EIO))?;
+        
+        #[cfg(not(target_arch = "wasm32"))]
+        let local_peer_id = self.store.local_peer_id.to_string();
+        #[cfg(target_arch = "wasm32")]
+        let local_peer_id = "".to_string();
+        
+        map.insert("owner_peer", local_peer_id).map_err(|_| Errno::from(libc::EIO))?;
+        let acl = map.insert_container("acl", loro::LoroMap::new()).map_err(|_| Errno::from(libc::EIO))?;
+        acl.insert("*", "rw").map_err(|_| Errno::from(libc::EIO))?; // default wildcard rw for demo
+        Ok(())
+    }
+
+    pub fn is_virtual_path(&self, path: &OsStr) -> bool {
+        let path_str = path.to_string_lossy();
+        path_str == "/.ditto" || path_str.starts_with("/.ditto/")
+    }
+
+    pub fn resolve_path_at_doc(&self, doc: &loro::LoroDoc, path: &str) -> Option<Option<TreeID>> {
+        if path.is_empty() || path == "/" {
             return Some(None);
         }
 
-        if let Some(res) = self.path_cache.read().get(&path_str) {
-            return Some(res.clone());
-        }
+        let components: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-        let components: Vec<&str> = path_str.trim_start_matches('/').split('/').collect();
-
-        let doc_lock = self.store.get_fs_root();
-        let doc = doc_lock.read();
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -137,10 +251,94 @@ impl DittoFS {
             current_node = found;
         }
 
-        self.path_cache.write().insert(path_str, current_node.clone());
         Some(current_node)
     }
 
+    fn getattr_at_checkout(&self, doc: &loro::LoroDoc, path: &str) -> Result<ReplyAttr> {
+        let node_id = self.resolve_path_at_doc(doc, path).ok_or_else(|| Errno::from(libc::ENOENT))?;
+        let metadata = doc.get_map("fs_metadata");
+
+        let (size, mode, kind, nlink, ctime, mtime) = if let Some(id) = node_id {
+            if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&id.to_string()) {
+                let type_str = if let Some(ValueOrContainer::Value(loro::LoroValue::String(t))) = m.get("type") {
+                    t.as_ref().to_string()
+                } else {
+                    "file".to_string()
+                };
+                let is_dir = type_str == "directory";
+                let kind = Self::file_type_from_str(&type_str);
+
+                let mode = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("mode") { v as u16 } else { 0o755 };
+
+                let nlink = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("nlink") {
+                    v as u32
+                } else {
+                    if is_dir { 2 } else { 1 }
+                };
+
+                let size = if is_dir {
+                    4096
+                } else {
+                    self.get_file_size(&m, &id)
+                };
+
+                let ctime = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(c))) = m.get("ctime") { c as u64 } else { 0 };
+                let mtime = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(mt))) = m.get("mtime") { mt as u64 } else { 0 };
+
+                (size, mode, kind, nlink, ctime, mtime)
+            } else {
+                return Err(libc::ENOENT.into());
+            }
+        } else {
+            (4096, 0o755, FileType::Directory, 2, 0, 0)
+        };
+
+        let ctime_dur = UNIX_EPOCH + std::time::Duration::from_secs(ctime);
+        let mtime_dur = UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+
+        Ok(ReplyAttr {
+            attr: FileAttr {
+                size,
+                blocks: 0,
+                atime: mtime_dur,
+                mtime: mtime_dur,
+                ctime: ctime_dur,
+                kind,
+                perm: mode & 0o555, // read-only
+                nlink,
+                uid: 1000,
+                gid: 1000,
+                rdev: 0,
+                blksize: 4096,
+            },
+            ttl: std::time::Duration::from_secs(1),
+        })
+    }
+
+    pub fn resolve_path(&self, path: &OsStr) -> Option<Option<TreeID>> {
+        let path_str = path.to_string_lossy().to_string();
+        if path_str.is_empty() || path_str == "/" {
+            return Some(None);
+        }
+
+        if path_str == "/.ditto" || path_str.starts_with("/.ditto/") {
+             // Virtual directory — does not map to a TreeID
+             return None;
+        }
+
+        if let Some(res) = self.path_cache.read().get(&path_str) {
+            return Some(res.clone());
+        }
+
+        let doc_lock = self.store.get_fs_root();
+        let doc = doc_lock.read();
+        let res = self.resolve_path_at_doc(&doc, &path_str);
+        
+        if let Some(ref r) = res {
+            self.path_cache.write().insert(path_str, r.clone());
+        }
+        res
+    }
     /// Helper to determine FileType from a type string
     fn file_type_from_str(type_str: &str) -> FileType {
         match type_str {
@@ -166,6 +364,18 @@ impl PathFilesystem for DittoFS {
     }
 
     async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<ReplyEntry> {
+        let parent_str = parent.to_string_lossy();
+        let name_str = name.to_string_lossy();
+        let full_path = if parent_str == "/" { format!("/{}", name_str) } else { format!("{}/{}", parent_str, name_str) };
+
+        if self.is_virtual_path(OsStr::new(&full_path)) {
+             let attr_reply = self.getattr(_req, Some(OsStr::new(&full_path)), None, 0).await?;
+             return Ok(ReplyEntry {
+                 ttl: std::time::Duration::from_secs(1),
+                 attr: attr_reply.attr,
+             });
+        }
+
         let parent_id = self.resolve_path(parent).ok_or_else(|| Errno::from(libc::ENOENT))?;
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.read();
@@ -173,10 +383,25 @@ impl PathFilesystem for DittoFS {
         let metadata = doc.get_map("fs_metadata");
 
         if let Some(children) = tree.children(parent_id) {
-            for child_id in children {
+            for child_id in &children {
                 if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&child_id.to_string()) {
                     if let Some(ValueOrContainer::Value(loro::LoroValue::String(n))) = m.get("name") {
-                        if n.as_ref() == name.to_string_lossy() {
+                        let mut final_name = n.as_ref().to_string();
+                        // Conflict mangling check
+                        let same_name_count = children.iter().filter(|cid| {
+                             if let Some(ValueOrContainer::Container(Container::Map(cm))) = metadata.get(&cid.to_string()) {
+                                 if let Some(ValueOrContainer::Value(loro::LoroValue::String(cn))) = cm.get("name") {
+                                     return cn.as_ref() == n.as_ref();
+                                 }
+                             }
+                             false
+                        }).count();
+
+                        if same_name_count > 1 {
+                             final_name = format!("{} ({})", final_name, &child_id.peer.to_string()[..4]);
+                        }
+
+                        if final_name == name.to_string_lossy() {
                             let type_str = if let Some(ValueOrContainer::Value(loro::LoroValue::String(t))) = m.get("type") {
                                 t.as_ref().to_string()
                             } else {
@@ -185,14 +410,11 @@ impl PathFilesystem for DittoFS {
                             let kind = Self::file_type_from_str(&type_str);
                             let is_dir = type_str == "directory";
 
-                            // For files/symlinks, always measure actual blob size
+                            // For files/symlinks, trust metadata size
                             let size = if is_dir {
                                 4096
                             } else {
-                                let blob_key = format!("blob:{}", child_id);
-                                self.store.get_blob(&blob_key)
-                                    .map(|b| b.len() as u64)
-                                    .unwrap_or(0)
+                                self.get_file_size(&m, &child_id)
                             };
 
                             let mode = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("mode") {
@@ -245,6 +467,9 @@ impl PathFilesystem for DittoFS {
 
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.write();
+        
+        self.check_write_permission(&doc, parent_id)?;
+        
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -261,6 +486,7 @@ impl PathFilesystem for DittoFS {
         }
 
         let new_id = tree.create(parent_id).map_err(|_| Errno::from(libc::EIO))?;
+        self.set_initial_permissions(&doc, new_id)?;
 
         let map = metadata.insert_container(&new_id.to_string(), loro::LoroMap::new()).map_err(|_| Errno::from(libc::EIO))?;
         map.insert("name", name.to_string_lossy().to_string()).map_err(|_| Errno::from(libc::EIO))?;
@@ -324,6 +550,9 @@ impl PathFilesystem for DittoFS {
 
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.write();
+        
+        self.check_write_permission(&doc, parent_id)?;
+        
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -340,6 +569,7 @@ impl PathFilesystem for DittoFS {
         }
 
         let new_id = tree.create(parent_id).map_err(|_| Errno::from(libc::EIO))?;
+        self.set_initial_permissions(&doc, new_id)?;
 
         let map = metadata.insert_container(&new_id.to_string(), loro::LoroMap::new()).map_err(|_| Errno::from(libc::EIO))?;
         map.insert("name", name.to_string_lossy().to_string()).map_err(|_| Errno::from(libc::EIO))?;
@@ -413,6 +643,45 @@ impl PathFilesystem for DittoFS {
         size: u32,
     ) -> Result<ReplyData> {
         let path = path.ok_or_else(|| Errno::from(libc::EBADF))?;
+        let path_str = path.to_string_lossy();
+
+        if path_str.starts_with("/.ditto/snapshots/") {
+            let parts: Vec<&str> = path_str.strip_prefix("/.ditto/snapshots/").unwrap().split('/').collect();
+            if parts.len() <= 1 { return Err(libc::EISDIR.into()); }
+            let snap_name = parts[0];
+            let sub_path = format!("/{}", parts[1..].join("/"));
+
+            if let Some(vv) = self.store.get_checkpoint(snap_name) {
+                let doc_lock = self.store.get_fs_root();
+                let doc = doc_lock.read().clone();
+                let _ = doc.checkout(&vv);
+
+                let tree_id = self.resolve_path_at_doc(&doc, &sub_path).flatten().ok_or_else(|| Errno::from(libc::ENOENT))?;
+                let metadata = doc.get_map("fs_metadata");
+                let meta_map = match metadata.get(&tree_id.to_string()) {
+                    Some(ValueOrContainer::Container(Container::Map(m))) => m,
+                    _ => return Err(libc::EIO.into()),
+                };
+
+                let bytes = self.get_file_bytes(&meta_map, &tree_id);
+                let end = std::cmp::min((offset + size as u64) as usize, bytes.len());
+                let start = std::cmp::min(offset as usize, bytes.len());
+                let data = bytes[start..end].to_vec();
+                return Ok(ReplyData { data: data.into() });
+            } else {
+                return Err(libc::ENOENT.into());
+            }
+        } else if path_str == "/.ditto/log" {
+            let doc_lock = self.store.get_fs_root();
+            let doc = doc_lock.read();
+            let log_text = format!("DittoFS Oplog\nFrontiers: {:?}\nVV: {:?}\n", doc.oplog_frontiers(), doc.oplog_vv());
+            let bytes = log_text.as_bytes();
+            let end = std::cmp::min((offset + size as u64) as usize, bytes.len());
+            let start = std::cmp::min(offset as usize, bytes.len());
+            let data = bytes[start..end].to_vec();
+            return Ok(ReplyData { data: data.into() });
+        }
+
         let tree_id = self.resolve_path(path).flatten().ok_or_else(|| Errno::from(libc::ENOENT))?;
 
         let doc_lock = self.store.get_fs_root();
@@ -429,8 +698,7 @@ impl PathFilesystem for DittoFS {
             }
         }
 
-        let blob_key = format!("blob:{}", tree_id);
-        let bytes = self.store.get_blob(&blob_key).unwrap_or_default();
+        let bytes = self.get_file_bytes(&meta_map, &tree_id);
 
         let end = std::cmp::min((offset + size as u64) as usize, bytes.len());
         let start = std::cmp::min(offset as usize, bytes.len());
@@ -455,21 +723,46 @@ impl PathFilesystem for DittoFS {
 
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.write();
+        
+        self.check_write_permission(&doc, Some(tree_id))?;
+        
         let metadata = doc.get_map("fs_metadata");
         let meta_map = match metadata.get(&tree_id.to_string()) {
             Some(ValueOrContainer::Container(Container::Map(m))) => m,
             _ => return Err(libc::EIO.into()),
         };
 
-        let blob_key = format!("blob:{}", tree_id);
-        let mut buf = self.store.get_blob(&blob_key).unwrap_or_default();
+        let mut buf = self.get_file_bytes(&meta_map, &tree_id);
+
         let end = (offset as usize) + data.len();
         if buf.len() < end {
             buf.resize(end, 0);
         }
         buf[offset as usize..end].copy_from_slice(data);
         let len = buf.len();
-        self.store.set_blob(&blob_key, &buf).map_err(|_| Errno::from(libc::EIO))?;
+        
+        let chunk_threshold = 1024 * 1024; // 1MB
+        let mut changed_blobs = Vec::new();
+
+        if len > chunk_threshold {
+            let chunk_results = self.store.set_blob_chunks(&buf).map_err(|_| Errno::from(libc::EIO))?;
+            let l = meta_map.insert_container("chunks", loro::LoroList::new()).map_err(|_| Errno::from(libc::EIO))?;
+            for (hash, is_new) in chunk_results {
+                l.insert(l.len(), hash.clone()).map_err(|_| Errno::from(libc::EIO))?;
+                if is_new {
+                    changed_blobs.push(format!("cas:{}", hash));
+                }
+            }
+            let _ = meta_map.delete("blob_hash");
+        } else {
+            let (hash_hex, is_new) = self.store.set_blob_cas(&buf).map_err(|_| Errno::from(libc::EIO))?;
+            meta_map.insert("blob_hash", hash_hex.clone()).map_err(|_| Errno::from(libc::EIO))?;
+            let _ = meta_map.delete("chunks");
+            if is_new {
+                changed_blobs.push(format!("cas:{}", hash_hex));
+            }
+        }
+        
         self.size_cache.write().insert(tree_id, len as u64);
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -482,7 +775,7 @@ impl PathFilesystem for DittoFS {
         {
             doc.commit();
             let _ = self.store.save_doc("root", &doc);
-            self.sync_local_delta(&doc, vec![blob_key]);
+            self.sync_local_delta(&doc, changed_blobs);
         }
 
         Ok(ReplyWrite {
@@ -503,6 +796,10 @@ impl PathFilesystem for DittoFS {
 
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.write();
+        
+        self.check_write_permission(&doc, origin_parent_id)?;
+        self.check_write_permission(&doc, target_parent_id)?;
+        
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -570,6 +867,9 @@ impl PathFilesystem for DittoFS {
         let parent_id = self.resolve_path(parent).ok_or_else(|| Errno::from(libc::ENOENT))?;
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.write();
+        
+        self.check_write_permission(&doc, parent_id)?;
+        
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -604,6 +904,9 @@ impl PathFilesystem for DittoFS {
         let parent_id = self.resolve_path(parent).ok_or_else(|| Errno::from(libc::ENOENT))?;
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.write();
+        
+        self.check_write_permission(&doc, parent_id)?;
+        
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
@@ -663,6 +966,9 @@ impl PathFilesystem for DittoFS {
 
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.write();
+        
+        self.check_write_permission(&doc, node_id)?;
+        
         let metadata = doc.get_map("fs_metadata");
 
         let meta_map = if let Some(id) = node_id {
@@ -695,14 +1001,34 @@ impl PathFilesystem for DittoFS {
         let mut changed_blobs = vec![];
         // Handle truncation (most important: this is what echo uses before writing)
         if let Some(new_size) = set_attr.size {
-            let blob_key = format!("blob:{}", node_id.unwrap());
-            let mut buf = self.store.get_blob(&blob_key).unwrap_or_default();
+            let mut buf = self.get_file_bytes(&meta_map, &node_id.unwrap());
+
             buf.resize(new_size as usize, 0);
-            self.store.set_blob(&blob_key, &buf).map_err(|_| Errno::from(libc::EIO))?;
+            let len = buf.len();
+            let chunk_threshold = 1024 * 1024; // 1MB
+
+            if len > chunk_threshold {
+                let chunk_results = self.store.set_blob_chunks(&buf).map_err(|_| Errno::from(libc::EIO))?;
+                let l = meta_map.insert_container("chunks", loro::LoroList::new()).map_err(|_| Errno::from(libc::EIO))?;
+                for (hash, is_new) in chunk_results {
+                    l.insert(l.len(), hash.clone()).map_err(|_| Errno::from(libc::EIO))?;
+                    if is_new {
+                        changed_blobs.push(format!("cas:{}", hash));
+                    }
+                }
+                let _ = meta_map.delete("blob_hash");
+            } else {
+                let (hash_hex, is_new) = self.store.set_blob_cas(&buf).map_err(|_| Errno::from(libc::EIO))?;
+                meta_map.insert("blob_hash", hash_hex.clone()).map_err(|_| Errno::from(libc::EIO))?;
+                let _ = meta_map.delete("chunks");
+                if is_new {
+                    changed_blobs.push(format!("cas:{}", hash_hex));
+                }
+            }
+            
             self.size_cache.write().insert(node_id.unwrap(), new_size);
 
             meta_map.insert("size", new_size as i64).map_err(|_| Errno::from(libc::EIO))?;
-            changed_blobs.push(blob_key);
         }
 
         if let Some(mode) = set_attr.mode {
@@ -728,14 +1054,11 @@ impl PathFilesystem for DittoFS {
         let kind = Self::file_type_from_str(&type_str);
         let mode_val = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = meta_map.get("mode") { v as u16 } else { 0o755 };
 
-        // For files, always measure the actual blob size
+        // For files, trust metadata size
         let size_val = if is_dir {
             4096
         } else {
-            let blob_key = format!("blob:{}", node_id.unwrap());
-            self.store.get_blob(&blob_key)
-                .map(|b| b.len() as u64)
-                .unwrap_or(0)
+            self.get_file_size(&meta_map, &node_id.unwrap())
         };
 
         let ctime_val = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(c))) = meta_map.get("ctime") { c as u64 } else { ts };
@@ -771,102 +1094,120 @@ impl PathFilesystem for DittoFS {
         _flags: u32,
     ) -> Result<ReplyAttr> {
         let path = path.unwrap_or_else(|| OsStr::new("/"));
+        let path_str = path.to_string_lossy();
+        
+        if self.is_virtual_path(path) {
+            let now = SystemTime::now();
+            let is_dir = if path_str == "/.ditto" || path_str == "/.ditto/snapshots" {
+                true
+            } else if path_str == "/.ditto/log" {
+                false
+            } else if path_str.starts_with("/.ditto/snapshots/") {
+                let parts: Vec<&str> = path_str.strip_prefix("/.ditto/snapshots/").unwrap().split('/').collect();
+                if parts.len() == 1 {
+                    true // snapshot root
+                } else {
+                    // inside a snapshot. we need to resolve it against the old state.
+                    let snap_name = parts[0];
+                    let sub_path = parts[1..].join("/");
+                    if let Some(vv) = self.store.get_checkpoint(snap_name) {
+                        let doc_lock = self.store.get_fs_root();
+                        let doc = doc_lock.read().clone();
+                        let _ = doc.checkout(&vv);
+                        // Now we need to resolve sub_path in this checked-out doc.
+                        // This is tricky because resolve_path uses the current doc.
+                        // For now, let's just return a generic file attr if it exists.
+                        return self.getattr_at_checkout(&doc, &sub_path);
+                    } else {
+                        return Err(libc::ENOENT.into());
+                    }
+                }
+            } else {
+                return Err(libc::ENOENT.into());
+            };
+
+            return Ok(ReplyAttr {
+                attr: FileAttr {
+                    size: 4096,
+                    blocks: 0,
+                    atime: now.into(),
+                    mtime: now.into(),
+                    ctime: now.into(),
+                    kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
+                    perm: 0o555,
+                    nlink: if is_dir { 2 } else { 1 },
+                    uid: 1000,
+                    gid: 1000,
+                    rdev: 0,
+                    blksize: 4096,
+                },
+                ttl: std::time::Duration::from_secs(1),
+            });
+        }
+
         let node_id = self.resolve_path(path).ok_or_else(|| Errno::from(libc::ENOENT))?;
 
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.read();
         let metadata = doc.get_map("fs_metadata");
 
-        let mut is_dir = true;
-        let mut size: u64 = 4096;
-        let mut mode: u16 = 0o755;
         let now = SystemTime::now();
-        let mut ctime = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let mut mtime = ctime;
-        let mut kind = FileType::Directory;
-
-        if let Some(id) = node_id {
+        let (size, mode, kind, nlink, ctime, mtime) = if let Some(id) = node_id {
             if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&id.to_string()) {
                 let type_str = if let Some(ValueOrContainer::Value(loro::LoroValue::String(t))) = m.get("type") {
                     t.as_ref().to_string()
                 } else {
                     "file".to_string()
                 };
-                is_dir = type_str == "directory";
-                kind = Self::file_type_from_str(&type_str);
+                let is_dir = type_str == "directory";
+                let kind = Self::file_type_from_str(&type_str);
 
-                mode = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("mode") { v as u16 } else { 0o755 };
+                let mode = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("mode") { v as u16 } else { 0o755 };
 
-                let nlink_val = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("nlink") {
+                let nlink = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("nlink") {
                     v as u32
                 } else {
                     if is_dir { 2 } else { 1 }
                 };
 
-                // For files, always measure the actual blob size — never trust metadata
-                size = if is_dir {
+                let size = if is_dir {
                     4096
                 } else {
-                    if let Some(&s) = self.size_cache.read().get(&id) {
-                        s
-                    } else {
-                        let blob_key = format!("blob:{}", id);
-                        let s = self.store.get_blob(&blob_key)
-                            .map(|b| b.len() as u64)
-                            .unwrap_or(0);
-                        self.size_cache.write().insert(id, s);
-                        s
-                    }
+                    self.get_file_size(&m, &id)
                 };
 
-                ctime = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(c))) = m.get("ctime") { c as u64 } else { ctime };
-                mtime = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(mt))) = m.get("mtime") { mt as u64 } else { mtime };
+                let now_ts = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                let ctime = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(c))) = m.get("ctime") { c as u64 } else { now_ts };
+                let mtime = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(mt))) = m.get("mtime") { mt as u64 } else { now_ts };
 
-                let ctime_dur = UNIX_EPOCH + std::time::Duration::from_secs(ctime);
-                let mtime_dur = UNIX_EPOCH + std::time::Duration::from_secs(mtime);
-
-                return Ok(ReplyAttr {
-                    attr: FileAttr {
-                        size,
-                        blocks: 0,
-                        atime: mtime_dur,
-                        mtime: mtime_dur,
-                        ctime: ctime_dur,
-                        kind,
-                        perm: mode & 0o777,
-                        nlink: nlink_val,
-                        uid: 1000,
-                        gid: 1000,
-                        rdev: 0,
-                        blksize: 4096,
-                    },
-                    ttl: std::time::Duration::from_secs(1),
-                });
+                (size, mode, kind, nlink, ctime, mtime)
             } else {
                 return Err(libc::ENOENT.into());
             }
-        }
+        } else {
+            // Root directory
+            let ts = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            (4096, 0o755, FileType::Directory, 2, ts, ts)
+        };
 
         let ctime_dur = UNIX_EPOCH + std::time::Duration::from_secs(ctime);
         let mtime_dur = UNIX_EPOCH + std::time::Duration::from_secs(mtime);
 
-        let attr = FileAttr {
-            size,
-            blocks: 0,
-            atime: mtime_dur,
-            mtime: mtime_dur,
-            ctime: ctime_dur,
-            kind,
-            perm: mode & 0o777,
-            nlink: 2,
-            uid: 1000,
-            gid: 1000,
-            rdev: 0,
-            blksize: 4096,
-        };
-
         Ok(ReplyAttr {
-            attr,
+            attr: FileAttr {
+                size,
+                blocks: 0,
+                atime: mtime_dur,
+                mtime: mtime_dur,
+                ctime: ctime_dur,
+                kind,
+                perm: mode & 0o777,
+                nlink,
+                uid: 1000,
+                gid: 1000,
+                rdev: 0,
+                blksize: 4096,
+            },
             ttl: std::time::Duration::from_secs(1),
         })
     }
@@ -896,14 +1237,76 @@ impl PathFilesystem for DittoFS {
             }));
         }
 
+        let path_str = path.to_string_lossy();
+        if path_str == "/.ditto" {
+            entries.push(Ok(DirectoryEntry { kind: FileType::Directory, name: "snapshots".into(), offset: 3 }));
+            entries.push(Ok(DirectoryEntry { kind: FileType::RegularFile, name: "log".into(), offset: 4 }));
+            let stream = stream::iter(entries).boxed();
+            return Ok(ReplyDirectory { entries: stream });
+        } else if path_str == "/.ditto/snapshots" {
+            let checkpoints = self.store.list_checkpoints();
+            for (i, name) in checkpoints.iter().enumerate() {
+                entries.push(Ok(DirectoryEntry {
+                    kind: FileType::Directory,
+                    name: name.clone().into(),
+                    offset: (i as i64) + 3,
+                }));
+            }
+            let stream = stream::iter(entries).boxed();
+            return Ok(ReplyDirectory { entries: stream });
+        } else if path_str.starts_with("/.ditto/snapshots/") {
+            let parts: Vec<&str> = path_str.strip_prefix("/.ditto/snapshots/").unwrap().split('/').collect();
+            let snap_name = parts[0];
+            let sub_path = if parts.len() > 1 { format!("/{}", parts[1..].join("/")) } else { "/".to_string() };
+            
+            if let Some(vv) = self.store.get_checkpoint(snap_name) {
+                let doc_lock = self.store.get_fs_root();
+                let doc = doc_lock.read().clone();
+                let _ = doc.checkout(&vv);
+                
+                let parent_id = self.resolve_path_at_doc(&doc, &sub_path);
+                if let Some(id) = parent_id {
+                    let tree = doc.get_tree("fs_tree");
+                    let metadata = doc.get_map("fs_metadata");
+                    if let Some(children) = tree.children(id) {
+                        for (i, child_id) in children.iter().enumerate() {
+                            if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&child_id.to_string()) {
+                                if let Some(ValueOrContainer::Value(loro::LoroValue::String(n))) = m.get("name") {
+                                    let type_str = if let Some(ValueOrContainer::Value(loro::LoroValue::String(t))) = m.get("type") {
+                                        t.as_ref().to_string()
+                                    } else { "file".to_string() };
+                                    
+                                    entries.push(Ok(DirectoryEntry {
+                                        kind: Self::file_type_from_str(&type_str),
+                                        name: n.as_ref().to_string().into(),
+                                        offset: (i as i64) + 3,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    return Err(libc::ENOENT.into());
+                }
+            } else {
+                return Err(libc::ENOENT.into());
+            }
+            let stream = stream::iter(entries).boxed();
+            return Ok(ReplyDirectory { entries: stream });
+        }
+
         let parent_id = self.resolve_path(path).unwrap_or(None);
+        if path_str == "/" && offset < 3 {
+             entries.push(Ok(DirectoryEntry { kind: FileType::Directory, name: ".ditto".into(), offset: 3 }));
+        }
+
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.read();
         let tree = doc.get_tree("fs_tree");
         let metadata = doc.get_map("fs_metadata");
 
         if let Some(children) = tree.children(parent_id) {
-            let mut current_offset: i64 = 3;
+            let mut current_offset: i64 = 4;
             
             // Collect all names to detect conflicts
             let mut name_counts = std::collections::HashMap::new();
@@ -989,14 +1392,101 @@ impl PathFilesystem for DittoFS {
                 kind: FileType::Directory,
                 name: "..".into(),
                 offset: 2,
-                attr,
+                attr: FileAttr {
+                    size: 4096,
+                    blocks: 0,
+                    atime: now.into(),
+                    mtime: now.into(),
+                    ctime: now.into(),
+                    kind: FileType::Directory,
+                    perm: 0o755,
+                    nlink: 2,
+                    uid: 1000,
+                    gid: 1000,
+                    rdev: 0,
+                    blksize: 4096,
+                },
                 entry_ttl: std::time::Duration::from_secs(1),
                 attr_ttl: std::time::Duration::from_secs(1),
             }));
         }
 
-        // Fetch dynamic children from Loro
+        let path_str = path.to_string_lossy();
+        if path_str == "/.ditto" {
+            let snap_attr = self.getattr(_req, Some(OsStr::new("/.ditto/snapshots")), None, 0).await?.attr;
+            entries.push(Ok(DirectoryEntryPlus { kind: FileType::Directory, name: "snapshots".into(), offset: 3, attr: snap_attr, entry_ttl: std::time::Duration::from_secs(1), attr_ttl: std::time::Duration::from_secs(1) }));
+            let log_attr = FileAttr { size: 0, blocks: 0, atime: now.into(), mtime: now.into(), ctime: now.into(), kind: FileType::RegularFile, perm: 0o444, nlink: 1, uid: 1000, gid: 1000, rdev: 0, blksize: 4096 };
+            entries.push(Ok(DirectoryEntryPlus { kind: FileType::RegularFile, name: "log".into(), offset: 4, attr: log_attr, entry_ttl: std::time::Duration::from_secs(1), attr_ttl: std::time::Duration::from_secs(1) }));
+            let stream = stream::iter(entries).boxed();
+            return Ok(ReplyDirectoryPlus { entries: stream });
+        } else if path_str == "/.ditto/snapshots" {
+            let checkpoints = self.store.list_checkpoints();
+            for (i, name) in checkpoints.iter().enumerate() {
+                let snap_path = format!("{}/{}", path_str, name);
+                let attr = self.getattr(_req, Some(OsStr::new(&snap_path)), None, 0).await?.attr;
+                entries.push(Ok(DirectoryEntryPlus {
+                    kind: FileType::Directory,
+                    name: name.clone().into(),
+                    offset: (i as i64) + 3,
+                    attr,
+                    entry_ttl: std::time::Duration::from_secs(1),
+                    attr_ttl: std::time::Duration::from_secs(1),
+                }));
+            }
+            let stream = stream::iter(entries).boxed();
+            return Ok(ReplyDirectoryPlus { entries: stream });
+        } else if path_str.starts_with("/.ditto/snapshots/") {
+            let parts: Vec<&str> = path_str.strip_prefix("/.ditto/snapshots/").unwrap().split('/').collect();
+            let snap_name = parts[0];
+            let sub_path_raw = if parts.len() > 1 { format!("/{}", parts[1..].join("/")) } else { "/".to_string() };
+            
+            if let Some(vv) = self.store.get_checkpoint(snap_name) {
+                let doc_lock = self.store.get_fs_root();
+                let doc = doc_lock.read().clone();
+                let _ = doc.checkout(&vv);
+                
+                let parent_id = self.resolve_path_at_doc(&doc, &sub_path_raw);
+                if let Some(id) = parent_id {
+                    let tree = doc.get_tree("fs_tree");
+                    let metadata = doc.get_map("fs_metadata");
+                    if let Some(children) = tree.children(id) {
+                        for (i, child_id) in children.iter().enumerate() {
+                            if let Some(ValueOrContainer::Container(Container::Map(m))) = metadata.get(&child_id.to_string()) {
+                                if let Some(ValueOrContainer::Value(loro::LoroValue::String(n))) = m.get("name") {
+                                    let name_str = n.as_ref().to_string();
+                                    let child_path = if sub_path_raw == "/" { format!("/{}", name_str) } else { format!("{}/{}", sub_path_raw, name_str) };
+                                    let full_snap_path = format!("/.ditto/snapshots/{}{}", snap_name, child_path);
+                                    let attr = self.getattr(_req, Some(OsStr::new(&full_snap_path)), None, 0).await?.attr;
+
+                                    entries.push(Ok(DirectoryEntryPlus {
+                                        kind: attr.kind,
+                                        name: name_str.into(),
+                                        offset: (i as i64) + 3,
+                                        attr,
+                                        entry_ttl: std::time::Duration::from_secs(1),
+                                        attr_ttl: std::time::Duration::from_secs(1),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    return Err(libc::ENOENT.into());
+                }
+            } else {
+                return Err(libc::ENOENT.into());
+            }
+            let stream = stream::iter(entries).boxed();
+            return Ok(ReplyDirectoryPlus { entries: stream });
+        }
+
         let parent_id = self.resolve_path(path).unwrap_or(None);
+        if path_str == "/" && offset < 3 {
+             let attr = self.getattr(_req, Some(OsStr::new("/.ditto")), None, 0).await?.attr;
+             entries.push(Ok(DirectoryEntryPlus { kind: FileType::Directory, name: ".ditto".into(), offset: 3, attr, entry_ttl: std::time::Duration::from_secs(1), attr_ttl: std::time::Duration::from_secs(1) }));
+        }
+
+        // Fetch dynamic children from Loro
         let doc_lock = self.store.get_fs_root();
         let doc = doc_lock.read();
         let tree = doc.get_tree("fs_tree");
@@ -1037,14 +1527,11 @@ impl PathFilesystem for DittoFS {
                         let kind = Self::file_type_from_str(&type_str);
                         let mode = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(v))) = m.get("mode") { v as u16 } else { 0o755 };
 
-                        // For files, always measure actual blob size
+                        // For files, trust metadata size
                         let size = if is_dir {
                             4096
                         } else {
-                            let blob_key = format!("blob:{}", child_id);
-                            self.store.get_blob(&blob_key)
-                                .map(|b| b.len() as u64)
-                                .unwrap_or(0)
+                            self.get_file_size(&m, &child_id)
                         };
 
                         let ct = if let Some(ValueOrContainer::Value(loro::LoroValue::I64(c))) = m.get("ctime") { c as u64 } else { now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() };
@@ -1238,3 +1725,4 @@ impl PathFilesystem for DittoFS {
         Ok(())
     }
 }
+
